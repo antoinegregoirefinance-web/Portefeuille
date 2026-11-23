@@ -5,7 +5,7 @@
    Seuls les symboles boursiers sont envoyés au fournisseur de cours choisi.
    ===================================================================== */
 
-const APP_VERSION = 'V1.0';
+const APP_VERSION = 'V1.1';
 const LS_KEY = 'mon_portefeuille_bourse_v1';
 const CG_EXEMPTION = 10000; // exonération annuelle taxe plus-values (2026)
 
@@ -62,7 +62,7 @@ function persist() {
   try { localStorage.setItem(LS_KEY, JSON.stringify(S)); }
   catch (e) { toast('⚠️ Enregistrement local impossible : ' + e.message, 'err'); }
 }
-function save() { persist(); scheduleTonio(); }
+function save() { persist(); dirty = true; scheduleSave(); }
 
 /* ---------------------------- Outils ---------------------------- */
 const $ = s => document.querySelector(s);
@@ -382,7 +382,7 @@ async function refreshPrices(force) {
     if (i < list.length - 1) await sleep(delay);
   }
   busy = false;
-  S.settings.lastRefresh = new Date().toISOString();
+  S.settings.lastRefresh = new Date().toISOString(); dirty = true;
   checkAlerts();
   save(); renderAll();
   let msg = `✅ ${ok}/${list.length} cours mis à jour.`;
@@ -456,6 +456,7 @@ async function pollQuotes(manual) {
     });
     S.settings.lastPoll = Date.now();
     const fired = checkAlerts();
+    dirty = true;
     if (fired) save(); else persist();
     renderHeader();
     if ($('#modal').classList.contains('hidden') && ['overview', 'positions', 'analyse', 'alertes'].includes(currentTab)) renderView(currentTab);
@@ -1224,12 +1225,23 @@ function renderSettings() {
     <div class="toolbar" style="margin-top:12px"><button class="btn" data-act="fxsave">Enregistrer</button><button class="btn" data-act="fxrefresh">Charger les taux BCE du jour</button>
       <span class="small muted">${s.fxDate ? 'Taux BCE du ' + fmtDate(s.fxDate) : 'Taux par défaut'}</span></div>
   </div>
-  <div class="card"><h3>🤖 Export pour Tonio</h3>
-    <p class="small">Écrit <code>bourse/bourse_latest.json</code> (format tonio_format 1.0) et une copie datée (30 jours) dans ton dossier <b>Tonio</b> du Drive. Contenu : positions, montants, plus-values, lectures, alertes et opérations des 90 derniers jours (sans les notes d'opérations).</p>
-    <div class="toolbar"><button class="btn" data-act="tonioDir">📁 Choisir le dossier Tonio</button><button class="btn primary" data-act="tonioSave">💾 Sauvegarder maintenant</button><button class="btn" data-act="tonioDl">⬇️ Télécharger le JSON</button>
-      <label class="small"><input type="checkbox" id="sAutoTonio" ${s.autoTonio ? 'checked' : ''}> réécrire automatiquement après chaque modification</label></div>
+  <div class="card"><h3>🤖 Double sauvegarde — Coffre + Tonio</h3>
+    <p class="small">Comme dans tes autres apps : deux sauvegardes dans deux dossiers différents du Drive (sur le PC, dans Chrome ou Edge), réécrites 30 secondes après chaque modification et toutes les 5 minutes si quelque chose a changé (cours compris), avec des copies datées sur 30 jours.</p>
+    <div class="grid2">
+      <div class="m" style="padding:12px"><b>🤖 Tonio</b> — dossier <code>Tonio</code>, lisible par Tonio
+        <div class="small" style="margin:6px 0">Chiffres globaux (valeur, plus-value, répartitions), <b>noms</b> des actions et ETF détenus et surveillés avec leurs % (poids, variation, lecture), alertes et mouvements inhabituels. <b>Jamais</b> : quantités, prix d'achat, montants par ligne, opérations, notes, clés.</div>
+        <button class="btn sm" data-act="tonioDir">📁 Choisir le dossier Tonio</button> <button class="btn sm" data-act="tonioDl">⬇️ Voir le JSON</button>
+        <div class="small muted" id="tonioStatus" style="margin-top:6px"></div></div>
+      <div class="m" style="padding:12px"><b>🔒 Coffre</b> — dossier <code>Coffre</code>, jamais partagé
+        <div class="small" style="margin:6px 0">Toutes les données de l'app (titres, opérations, alertes, historique des cours, réglages et clés), <b>chiffrées AES-256</b> avec ton code. Le code n'est jamais enregistré : à saisir une fois à chaque ouverture de l'app.</div>
+        <button class="btn sm" data-act="coffreDir">📁 Choisir le dossier Coffre</button>
+        ${!s.coffre ? '<button class="btn sm" data-act="coffreCode">🔑 Créer le code</button>' : coffreKey ? '' : '<button class="btn sm" data-act="coffreUnlock">🔓 Déverrouiller</button>'}
+        <label class="btn sm">⬆️ Restaurer depuis le Coffre<input type="file" id="coffreFile" accept=".mpcoffre" hidden></label>
+        <div class="small muted" id="coffreStatus" style="margin-top:6px"></div></div>
+    </div>
+    <div class="toolbar" style="margin-top:12px"><button class="btn primary" data-act="saveall">💾 Sauvegarder maintenant (Coffre + Tonio)</button>
+      <label class="small"><input type="checkbox" id="sAutoTonio" ${s.autoTonio ? 'checked' : ''}> sauvegarde automatique (après chaque modification et toutes les 5 min)</label></div>
     <div class="form-grid" style="margin-top:10px"><label class="full">Lien vers ton projet Claude (boutons « 🤖 Analyser avec Claude »)<input id="sClaudeUrl" value="${esc(s.claudeUrl || '')}" placeholder="https://claude.ai/project/… (sinon : nouvelle conversation)"></label></div>
-    <p class="small muted" id="tonioStatus"></p>
   </div>
   <div class="card"><h3>Sauvegarde complète</h3>
     <p class="small">Les données sont stockées dans ce navigateur, sur cet appareil. Pour les retrouver sur un autre appareil ou après un nettoyage du navigateur, télécharge une sauvegarde et réimporte-la.</p>
@@ -1269,12 +1281,13 @@ function buildTonio() {
     const a = p.asset, L = lecture(a, p);
     records.push({
       id: 'pos-' + a.id, type: 'position', title: nm(a), date: a.priceDate || null, status: p.latent >= 0 ? 'gain' : 'perte',
-      amount: r2(p.value), currency: 'EUR', category: TYPES[a.type] || 'Autre', tags: [a.sector, a.region].filter(Boolean),
+      amount: null, currency: a.ccy, category: CLASSES[assetClass(a)], tags: [a.sector, a.region].filter(Boolean),
       data: {
-        symbole: a.symbol || null, isin: a.isin || null, classe_actif: CLASSES[assetClass(a)], instrument: TYPES[a.type] || null, region: a.region || null, secteur: a.sector || null, devise: a.ccy, quantite: p.qty, pru: r4(p.pru), cours: a.price ?? null, date_cours: a.priceDate || null,
-        investi_eur: r2(p.costEur), plus_value_latente_eur: r2(p.latent), plus_value_latente_pct: r4(p.pctLatent), poids: r4(p.weight),
-        variation_jour_pct: p.dayPct != null ? r4(p.dayPct) : null, dividendes_eur: r2(p.divs), plus_value_realisee_eur: r2(p.realized),
-        rsi: L.I.rsi != null ? r2(L.I.rsi) : null, perf_1m: r4(L.I.perf1m), perf_3m: r4(L.I.perf3m), lecture: L.label, points: L.pts.map(x => x.m.replace(/<[^>]+>/g, ''))
+        symbole: a.symbol || null, isin: a.isin || null, classe_actif: CLASSES[assetClass(a)], instrument: TYPES[a.type] || null,
+        region: a.region || null, secteur: a.sector || null, devise: a.ccy, poids: r4(p.weight),
+        plus_value_latente_pct: r4(p.pctLatent), variation_jour_pct: p.dayPct != null ? r4(p.dayPct) : null,
+        perf_1m: r4(L.I.perf1m), perf_3m: r4(L.I.perf3m), rsi: L.I.rsi != null ? r2(L.I.rsi) : null,
+        lecture: L.label, points: L.pts.map(x => x.m.replace(/<[^>]+>/g, ''))
       }
     });
   });
@@ -1284,11 +1297,7 @@ function buildTonio() {
   });
   S.alerts.forEach(al => {
     const a = assetById(al.assetId);
-    records.push({ id: 'alert-' + al.id, type: 'alerte', title: alertText(al), date: al.triggeredAt ? al.triggeredAt.slice(0, 10) : null, status: !al.active ? 'inactive' : al.triggeredAt ? 'declenchee' : 'active', amount: null, currency: 'EUR', category: 'Alerte', tags: [], data: { symbole: a ? a.symbol : null, condition: al.kind, seuil: al.value, valeur_actuelle: al.lastValue ?? null } });
-  });
-  sortedTx().filter(t => t.date >= from).forEach(t => {
-    const a = assetById(t.assetId);
-    records.push({ id: 'tx-' + t.id, type: 'transaction', title: KINDS[t.kind] + (a ? ' ' + nm(a) : ''), date: t.date, status: t.kind, amount: r2(txTotal(t)), currency: 'EUR', category: 'Opération', tags: [], data: { symbole: a ? a.symbol : null, quantite: t.qty ?? null, cours: t.price ?? null, frais: t.fees ?? null, taxes: t.tax ?? null } });
+    records.push({ id: 'alert-' + al.id, type: 'alerte', title: alertText(al), date: al.triggeredAt ? al.triggeredAt.slice(0, 10) : null, status: !al.active ? 'inactive' : al.triggeredAt ? 'declenchee' : 'active', amount: null, currency: 'EUR', category: 'Alerte', tags: [], data: { symbole: a ? a.symbol : null, condition: al.kind, seuil: al.value, valeur_actuelle: a ? r2(alertCurrent(al, c, a)) : null } });
   });
   S.assets.filter(a => c.by[a.id].qty > 0 || a.watch).forEach(a => bigMoves(a, 30).forEach(m => records.push({ id: 'move-' + a.id + '-' + m.date, type: 'mouvement', title: `${nm(a)} ${pct(m.pct)}`, date: m.date, status: m.pct < 0 ? 'baisse' : 'hausse', amount: null, currency: a.ccy, category: 'Mouvement inhabituel', tags: [], data: { symbole: a.symbol || null, isin: a.isin || null, variation_pct: r4(m.pct), cloture: m.price, variation_habituelle_pct: r4(m.usual), en_portefeuille: c.by[a.id].qty > 0 } })));
   const trig = S.alerts.filter(a => a.active && a.triggeredAt).length;
@@ -1305,7 +1314,7 @@ function buildTonio() {
       exoneration_plus_values_restante: r2(Math.max(0, CG_EXEMPTION - Math.max(0, ry))), dividendes: r2(c.T.divs),
       liquidites: c.hasCash ? r2(c.cash) : null, nb_positions: c.open.length, alertes_declenchees: trig, cours_le_plus_ancien: oldest
     },
-    records, excluded: { private_items: 0 }
+    records, excluded: { private_items: S.tx.length }
   };
 }
 const IDB = {
@@ -1313,43 +1322,140 @@ const IDB = {
   async get(k) { const db = await this.open(); return new Promise((res, rej) => { const q = db.transaction('h').objectStore('h').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
   async set(k, v) { const db = await this.open(); return new Promise((res, rej) => { const q = db.transaction('h', 'readwrite').objectStore('h').put(v, k); q.onsuccess = () => res(); q.onerror = () => rej(q.error); }); }
 };
-let tonioDir = null, tonioTimer = null;
+/* ---------- Double sauvegarde : Tonio (lisible, données globales) + Coffre (complète, chiffrée) ---------- */
+let tonioDir = null, coffreDir = null, coffreKey = null, saveTimer = null, dirty = false, savePaused = '';
+const CF_IT = 300000, CF_TEMOIN = 'mon-portefeuille-ok';
+const b64e = buf => { let x = ''; new Uint8Array(buf).forEach(c => x += String.fromCharCode(c)); return btoa(x); };
+const b64d = t => Uint8Array.from(atob(t), c => c.charCodeAt(0));
+async function cfDerive(code, salt, it) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(code), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: b64d(salt), iterations: it || CF_IT, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function cfEncrypt(key, text) { const iv = crypto.getRandomValues(new Uint8Array(12)); const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text)); return { iv: b64e(iv), ct: b64e(ct) }; }
+async function cfDecrypt(key, iv, ct) { return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(iv) }, key, b64d(ct))); }
+
 function renderTonioStatus() {
-  const el = $('#tonioStatus'); if (!el) return;
-  el.textContent = (tonioDir ? 'Dossier : ' + tonioDir.name + '/bourse' : 'Aucun dossier choisi (Chrome ou Edge sur PC requis ; sinon, télécharge le JSON et dépose-le dans Tonio/bourse).') +
-    (S.settings.lastTonio ? ' · Dernier export : ' + new Date(S.settings.lastTonio).toLocaleString('fr-BE') : '');
+  const s = S.settings, t = $('#tonioStatus'), c = $('#coffreStatus');
+  if (t) t.textContent = (tonioDir ? '📁 ' + tonioDir.name + '/bourse' : '📁 aucun dossier choisi') + (s.lastTonio ? ' · dernière sauvegarde : ' + new Date(s.lastTonio).toLocaleString('fr-BE') : '');
+  if (c) c.textContent = (coffreDir ? '📁 ' + coffreDir.name + '/bourse' : '📁 aucun dossier choisi') + ' · ' + (!s.coffre ? '🔑 code non défini' : coffreKey ? '🔓 déverrouillé pour cette session' : '🔒 verrouillé') + (s.lastCoffre ? ' · dernière sauvegarde : ' + new Date(s.lastCoffre).toLocaleString('fr-BE') : '');
+  const bn = $('#saveBanner');
+  if (bn) { bn.classList.toggle('hidden', !savePaused); bn.querySelector('span').textContent = savePaused; }
 }
-function scheduleTonio() {
-  if (!S.settings.autoTonio || !tonioDir) return;
-  clearTimeout(tonioTimer); tonioTimer = setTimeout(() => saveTonio(false), 30000);
+function scheduleSave() {
+  if (!S.settings.autoTonio) return;
+  clearTimeout(saveTimer); saveTimer = setTimeout(() => saveAll(false), 30000);
 }
+setInterval(() => { if (dirty && S.settings.autoTonio) saveAll(false); }, 5 * 60000);
 function download(name, text) {
   const b = new Blob([text], { type: 'application/json' }), u = URL.createObjectURL(b), l = document.createElement('a');
   l.href = u; l.download = name; document.body.appendChild(l); l.click(); l.remove(); setTimeout(() => URL.revokeObjectURL(u), 2000);
 }
-async function chooseTonioDir() {
-  if (!window.showDirectoryPicker) { toast('Ce navigateur ne permet pas d\'écrire dans un dossier : le fichier va être téléchargé.'); return download('bourse_latest.json', JSON.stringify(buildTonio(), null, 2)); }
+async function pickDir(kind) {
+  if (!window.showDirectoryPicker) { toast('Ce navigateur ne permet pas d\'écrire dans un dossier : utilise Chrome ou Edge sur le PC.', 'err'); return null; }
   try {
-    const h = await window.showDirectoryPicker({ id: 'tonio', mode: 'readwrite' });
-    if (/coffre/i.test(h.name) && !confirm('Ce dossier s\'appelle « ' + h.name + ' ». L\'export Tonio ne doit pas aller dans le Coffre. Continuer quand même ?')) return;
-    tonioDir = h; await IDB.set('tonioDir', h); await saveTonio(true);
-  } catch (e) { if (e.name !== 'AbortError') toast('Erreur : ' + e.message, 'err'); }
+    const h = await window.showDirectoryPicker({ id: kind, mode: 'readwrite' });
+    const other = kind === 'tonio' ? coffreDir : tonioDir;
+    if (other && await h.isSameEntry(other)) { toast('Le Coffre et Tonio doivent être deux dossiers différents.', 'err'); return null; }
+    if (kind === 'tonio' && /coffre/i.test(h.name)) { toast('Ce dossier s\'appelle « ' + h.name + ' » : l\'export Tonio ne doit jamais aller dans le Coffre. Choisis le dossier Tonio.', 'err'); return null; }
+    if (kind === 'coffre' && /tonio/i.test(h.name)) { toast('Ce dossier s\'appelle « ' + h.name + ' » : Tonio pourrait lire le Coffre. Choisis le dossier Coffre.', 'err'); return null; }
+    if (kind === 'coffre' && !/coffre/i.test(h.name) && !confirm('Ce dossier s\'appelle « ' + h.name + ' ». Est-ce bien ton Coffre (non partagé avec Tonio) ?')) return null;
+    await IDB.set(kind + 'Dir', h);
+    return h;
+  } catch (e) { if (e.name !== 'AbortError') toast('Erreur : ' + e.message, 'err'); return null; }
 }
+async function chooseTonioDir() { const h = await pickDir('tonio'); if (h) { tonioDir = h; await saveTonio(true); renderTonioStatus(); } }
+async function chooseCoffreDir() { const h = await pickDir('coffre'); if (h) { coffreDir = h; renderTonioStatus(); await saveCoffre(true); } }
 async function writeFile(dir, name, text) { const fh = await dir.getFileHandle(name, { create: true }); const w = await fh.createWritable(); await w.write(text); await w.close(); }
+async function subDir(dir, manual) {
+  let perm = await dir.queryPermission({ mode: 'readwrite' });
+  if (perm !== 'granted') { if (!manual) return null; perm = await dir.requestPermission({ mode: 'readwrite' }); if (perm !== 'granted') { toast('Accès au dossier refusé.', 'err'); return null; } }
+  return dir.name.toLowerCase() === 'bourse' ? dir : dir.getDirectoryHandle('bourse', { create: true });
+}
+async function writeWithHistory(sub, prefix, ext, text) {
+  await writeFile(sub, `${prefix}_latest.${ext}`, text);
+  await writeFile(sub, `${prefix}_${today()}.${ext}`, text);
+  const limit = addDays(today(), -30), re = new RegExp('^' + prefix + '_(\\d{4}-\\d{2}-\\d{2})\\.' + ext + '$');
+  for await (const [name] of sub.entries()) { const m = name.match(re); if (m && m[1] < limit) await sub.removeEntry(name); }
+}
+/* Tonio : chiffres globaux + noms des titres, sans quantités ni montants par ligne ni opérations */
 async function saveTonio(manual) {
-  const text = JSON.stringify(buildTonio(), null, 2);
-  if (!tonioDir) { if (manual) { if (window.showDirectoryPicker) return chooseTonioDir(); download('bourse_latest.json', text); } return; }
+  if (!tonioDir) { if (manual) await chooseTonioDir(); return 'Tonio : dossier non choisi'; }
   try {
-    let perm = await tonioDir.queryPermission({ mode: 'readwrite' });
-    if (perm !== 'granted') { if (!manual) return; perm = await tonioDir.requestPermission({ mode: 'readwrite' }); if (perm !== 'granted') return toast('Accès au dossier refusé.', 'err'); }
-    const sub = tonioDir.name.toLowerCase() === 'bourse' ? tonioDir : await tonioDir.getDirectoryHandle('bourse', { create: true });
-    await writeFile(sub, 'bourse_latest.json', text);
-    await writeFile(sub, `bourse_${today()}.json`, text);
-    const limit = addDays(today(), -30);
-    for await (const [name] of sub.entries()) { const m = name.match(/^bourse_(\d{4}-\d{2}-\d{2})\.json$/); if (m && m[1] < limit) await sub.removeEntry(name); }
+    const sub = await subDir(tonioDir, manual); if (!sub) return 'Tonio : autorisation du dossier à renouveler';
+    await writeWithHistory(sub, 'bourse', 'json', JSON.stringify(buildTonio(), null, 2));
     S.settings.lastTonio = new Date().toISOString(); persist(); renderTonioStatus();
-    if (manual) toast('✅ Export Tonio écrit dans ' + tonioDir.name + '/bourse.');
-  } catch (e) { toast('Export Tonio impossible : ' + e.message, 'err'); }
+    if (manual) toast('✅ Sauvegarde Tonio écrite dans ' + tonioDir.name + '/bourse.');
+    return '';
+  } catch (e) { toast('Sauvegarde Tonio impossible : ' + e.message, 'err'); return 'Tonio : erreur'; }
+}
+/* Coffre : toutes les données de l'app (clés comprises), chiffrées AES-256 avec ton code */
+async function saveCoffre(manual) {
+  if (!coffreDir) { if (manual) await chooseCoffreDir(); return 'Coffre : dossier non choisi'; }
+  if (!S.settings.coffre) { if (manual) coffreModal('create'); return 'Coffre : code à définir'; }
+  if (!coffreKey) { if (manual) coffreModal('unlock'); return 'Coffre verrouillé : saisis ton code'; }
+  try {
+    const sub = await subDir(coffreDir, manual); if (!sub) return 'Coffre : autorisation du dossier à renouveler';
+    const { iv, ct } = await cfEncrypt(coffreKey, JSON.stringify(S));
+    const file = JSON.stringify({ format: 'mon-portefeuille-coffre', version: 1, app_version: APP_VERSION, saved_at: localISO(new Date()), salt: S.settings.coffre.salt, it: S.settings.coffre.it || CF_IT, iv, ct });
+    await writeWithHistory(sub, 'portefeuille_coffre', 'mpcoffre', file);
+    S.settings.lastCoffre = new Date().toISOString(); persist(); renderTonioStatus();
+    if (manual) toast('✅ Sauvegarde chiffrée écrite dans ' + coffreDir.name + '/bourse.');
+    return '';
+  } catch (e) { toast('Sauvegarde Coffre impossible : ' + e.message, 'err'); return 'Coffre : erreur'; }
+}
+async function saveAll(manual) {
+  const r = [await saveTonio(manual), await saveCoffre(manual)].filter(Boolean);
+  savePaused = r.length ? '💾 Sauvegarde automatique en pause — ' + r.join(' · ') : '';
+  if (!r.length) dirty = false;
+  renderTonioStatus();
+}
+function coffreModal(mode) {
+  const create = mode === 'create';
+  openModal(`<h2>🔒 ${create ? 'Créer le code du Coffre' : mode === 'restore' ? 'Code de cette sauvegarde' : 'Déverrouiller le Coffre'}</h2>
+    <p class="small">${create ? 'Ce code chiffre la sauvegarde complète. Il n\'est jamais enregistré : seul un témoin chiffré permet de vérifier qu\'il est juste. <b>Sans lui, la sauvegarde du Coffre est illisible</b> : note-le dans ton gestionnaire de mots de passe.' : 'Le code reste en mémoire jusqu\'à la fermeture de l\'app, pour les sauvegardes automatiques.'}</p>
+    <div class="form-grid"><label>Code<input type="password" id="cf1" autocomplete="off"></label>${create ? '<label>Confirme le code<input type="password" id="cf2" autocomplete="off"></label>' : ''}</div>
+    <div class="modal-actions"><button class="btn primary" data-act="coffreok" data-mode="${mode}">Valider</button><button class="btn" data-act="closemodal">Annuler</button></div>
+    <p class="hint" id="cfMsg"></p>`, () => $('#cf1').focus());
+}
+let pendingRestore = null;
+async function coffreOk(mode) {
+  const code = $('#cf1').value, msg = t => $('#cfMsg').textContent = t;
+  if (!window.crypto || !crypto.subtle) return msg('Chiffrement indisponible dans ce navigateur.');
+  try {
+    if (mode === 'create') {
+      if (code.length < 8) return msg('Au moins 8 caractères.');
+      if (code !== $('#cf2').value) return msg('Les deux codes sont différents.');
+      const salt = b64e(crypto.getRandomValues(new Uint8Array(16)));
+      msg('Création…'); const key = await cfDerive(code, salt, CF_IT);
+      S.settings.coffre = { salt, it: CF_IT, ...(await cfEncrypt(key, CF_TEMOIN)) }; coffreKey = key; persist();
+      closeModal(); renderAll(); await saveAll(true); return;
+    }
+    if (mode === 'unlock') {
+      const c = S.settings.coffre; msg('Vérification…');
+      const key = await cfDerive(code, c.salt, c.it);
+      if (await cfDecrypt(key, c.iv, c.ct).catch(() => null) !== CF_TEMOIN) return msg('Code incorrect.');
+      coffreKey = key; closeModal(); renderAll(); await saveAll(true); return;
+    }
+    if (mode === 'restore') {
+      const f = pendingRestore; msg('Déchiffrement…');
+      const key = await cfDerive(code, f.salt, f.it);
+      const txt = await cfDecrypt(key, f.iv, f.ct).catch(() => null);
+      if (!txt) return msg('Code incorrect pour cette sauvegarde.');
+      const d = JSON.parse(txt);
+      if (!confirm(`Restaurer la sauvegarde du ${f.saved_at ? new Date(f.saved_at).toLocaleString('fr-BE') : '?'} : ${d.assets.length} titre(s), ${d.tx.length} opération(s) ? Les données actuelles seront remplacées.`)) return;
+      const def = defaultState();
+      S = { ...def, ...d, settings: { ...def.settings, ...(d.settings || {}) } };
+      if (S.settings.coffre && S.settings.coffre.salt === f.salt) coffreKey = key;
+      pendingRestore = null; checkAlerts(); save(); closeModal(); showTab('overview'); toast('✅ Sauvegarde du Coffre restaurée.');
+    }
+  } catch (e) { msg('Erreur : ' + e.message); }
+}
+async function restoreCoffre(file) {
+  try {
+    const f = JSON.parse(await file.text());
+    if (f.format !== 'mon-portefeuille-coffre') throw new Error('ce n\'est pas une sauvegarde du Coffre de Mon Portefeuille');
+    pendingRestore = f; coffreModal('restore');
+  } catch (e) { toast('Fichier invalide : ' + e.message, 'err'); }
 }
 
 /* ---------------------------- Import CSV ---------------------------- */
@@ -1595,7 +1701,11 @@ document.addEventListener('click', async e => {
     case 'fxsave': document.querySelectorAll('[data-fx]').forEach(i => { const v = parseNum(i.value); if (v > 0) S.settings.fx[i.dataset.fx] = v; }); save(); toast('Taux enregistrés.'); renderAll(); break;
     case 'fxrefresh': refreshFx(false); break;
     case 'tonioDir': chooseTonioDir(); break;
-    case 'tonioSave': saveTonio(true); break;
+    case 'tonioSave': case 'saveall': saveAll(true); break;
+    case 'coffreDir': chooseCoffreDir(); break;
+    case 'coffreCode': coffreModal('create'); break;
+    case 'coffreUnlock': coffreModal('unlock'); break;
+    case 'coffreok': coffreOk(b.dataset.mode); break;
     case 'tonioDl': download('bourse_latest.json', JSON.stringify(buildTonio(), null, 2)); break;
     case 'backup': download(`mon_portefeuille_sauvegarde_${today()}.json`, JSON.stringify({ ...S, settings: { ...S.settings, avKey: '', tdKey: '' } }, null, 2)); toast('Sauvegarde téléchargée (sans tes clés API).'); break;
     case 'demo': loadDemo(); break;
@@ -1616,6 +1726,7 @@ document.addEventListener('change', e => {
   else if (t.id === 'sAutoTonio') { S.settings.autoTonio = t.checked; persist(); }
   else if (t.id === 'imH') { importCtx.h = +t.value; autoMap(); renderImport(); }
   else if (t.dataset && t.dataset.map) { importCtx.map[t.dataset.map] = t.value === '' ? null : +t.value; renderImport(); }
+  else if (t.id === 'coffreFile' && t.files[0]) { restoreCoffre(t.files[0]); t.value = ''; }
   else if (t.id === 'restoreFile' && t.files[0]) {
     t.files[0].text().then(txt => {
       try {
@@ -1625,21 +1736,25 @@ document.addEventListener('change', e => {
         const keep = { avKey: S.settings.avKey, tdKey: S.settings.tdKey };
         const def = defaultState();
         S = { ...def, ...d, settings: { ...def.settings, ...(d.settings || {}), ...keep } };
-        save(); showTab('overview'); toast('Sauvegarde restaurée.');
+        checkAlerts(); save(); showTab('overview'); toast('Sauvegarde restaurée.');
       } catch (err) { toast('Fichier invalide : ' + err.message, 'err'); }
     });
   }
   if (t.closest && t.closest('#txForm')) updateTxForm();
 });
 document.addEventListener('input', e => { if (e.target.closest && e.target.closest('#txForm') && e.target.id !== 'tTax') updateTxForm(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').classList.contains('hidden')) closeModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('#modal').classList.contains('hidden')) closeModal();
+  if (e.key === 'Enter' && (e.target.id === 'cf1' || e.target.id === 'cf2')) { const b = document.querySelector('[data-act=coffreok]'); if (b) b.click(); }
+});
 
 /* ---------------------------- Démarrage ---------------------------- */
 (async function init() {
   const t = (location.hash || '').slice(1);
   if (['overview', 'positions', 'repartition', 'transactions', 'analyse', 'alertes', 'parametres', 'bases'].includes(t)) currentTab = t;
   showTab(currentTab);
-  try { tonioDir = (await IDB.get('tonioDir')) || null; } catch { tonioDir = null; }
+  try { tonioDir = (await IDB.get('tonioDir')) || null; coffreDir = (await IDB.get('coffreDir')) || null; } catch { tonioDir = null; coffreDir = null; }
+  if (S.settings.autoTonio && (tonioDir || coffreDir)) saveAll(false);
   renderTonioStatus();
   if (!S.settings.fxDate || S.settings.fxDate < addDays(today(), -1)) refreshFx(true).then(renderAll);
   if (checkAlerts()) { persist(); renderAll(); }
