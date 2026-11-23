@@ -95,7 +95,9 @@ function protectedPage(D) {
   function openWith(key){
     return crypto.subtle.decrypt({name:'AES-GCM', iv:bytes(D.iv)}, key, bytes(D.ct)).then(function(pt){
       var html = new TextDecoder().decode(pt);
-      document.open(); document.write(html); document.close();
+      var go = function(){ document.open(); document.write(html); document.close(); };
+      // attendre la fin du chargement : sinon l'app s'insère dans la page du mot de passe au lieu de la remplacer
+      if (document.readyState === 'complete') go(); else window.addEventListener('load', go, { once: true });
     });
   }
   function err(t){ document.getElementById('e').textContent = t; }
