@@ -5,7 +5,7 @@
    Seuls les symboles boursiers sont envoyés au fournisseur de cours choisi.
    ===================================================================== */
 
-const APP_VERSION = 'V1.1';
+const APP_VERSION = 'V1.2';
 const LS_KEY = 'mon_portefeuille_bourse_v1';
 const CG_EXEMPTION = 10000; // exonération annuelle taxe plus-values (2026)
 
@@ -448,6 +448,10 @@ async function pollQuotes(manual) {
       if (!q || !(q.price > 0)) { miss.push(googleSym(a)); return; }
       const d = (q.time || '').slice(0, 10) || today();
       mergeHist(a, [[d, q.price, q.open, q.high, q.low]]);
+      const stamp = q.time || localISO(new Date()).slice(0, 16);
+      a.intraday = (a.intraday || []).filter(x => x[0].slice(0, 10) === stamp.slice(0, 10));
+      if (!a.intraday.length || a.intraday[a.intraday.length - 1][0] !== stamp) a.intraday.push([stamp, q.price]);
+      if (a.intraday.length > 150) a.intraday = a.intraday.slice(-150);
       if (q.prev > 0 && d === a.priceDate) a.prevClose = q.prev;
       a.priceTime = q.time || null;
       if (q.high52 > 0) a.hi52 = q.high52;
@@ -620,7 +624,7 @@ function renderHeader() {
 }
 function renderAll() { renderHeader(); renderView(currentTab); }
 function renderView(t) {
-  ({ overview: renderOverview, positions: renderPositions, repartition: renderRepartition, transactions: renderTx, analyse: renderAnalyse, alertes: renderAlerts, parametres: renderSettings }[t] || (() => { }))();
+  ({ overview: renderOverview, positions: renderPositions, repartition: renderRepartition, graphiques: renderCharts, transactions: renderTx, analyse: renderAnalyse, alertes: renderAlerts, parametres: renderSettings }[t] || (() => { }))();
 }
 function showTab(t) {
   currentTab = t;
@@ -807,6 +811,161 @@ function renderPositions() {
       ${c.open.length ? `<tfoot><tr><th colspan="5">Total</th><th class="r">${eur(c.T.value)}</th><th class="r ${cls(c.T.latent)}">${sEur(c.T.latent)}<div class="small">${pct(c.T.pctLatent)}</div></th><th class="r">100 %</th><th></th></tr></tfoot>` : ''}
     </table></div>
     <p class="hint">Clique sur une ligne pour voir son graphique, ses indicateurs, saisir un cours ou créer une alerte.</p></div>`;
+}
+
+/* ---------- Onglet Graphiques : historique de n'importe quel titre ---------- */
+const CHART_RANGES = { '1J': '1 jour', '1S': '1 semaine', '1M': '1 mois', '1A': '1 an', '10A': '10 ans' };
+const PRESETS = [
+  ['SPY', 'S&P 500 — via l\'ETF SPY', 'USD'], ['QQQ', 'Nasdaq 100 — via l\'ETF QQQ', 'USD'], ['DIA', 'Dow Jones — via l\'ETF DIA', 'USD'],
+  ['VGK', 'Actions européennes — via l\'ETF VGK', 'USD'], ['EFA', 'Pays développés hors USA — via l\'ETF EFA', 'USD'],
+  ['EEM', 'Marchés émergents — via l\'ETF EEM', 'USD'], ['GLD', 'Or — via l\'ETF GLD', 'USD'], ['SLV', 'Argent — via l\'ETF SLV', 'USD'],
+  ['IEF', 'Obligations d\'État US 7-10 ans — via l\'ETF IEF', 'USD'], ['TLT', 'Obligations d\'État US 20 ans+ — via l\'ETF TLT', 'USD']
+];
+let seriesCache = {};
+try { seriesCache = JSON.parse(localStorage.getItem('mp_series') || '{}'); } catch { seriesCache = {}; }
+function cacheGet(k, maxAge) { const e = seriesCache[k]; return e && Date.now() - e.t < maxAge ? e.rows : null; }
+function cacheSet(k, rows) {
+  seriesCache[k] = { t: Date.now(), rows };
+  try { localStorage.setItem('mp_series', JSON.stringify(seriesCache)); }
+  catch { seriesCache = { [k]: seriesCache[k] }; try { localStorage.setItem('mp_series', JSON.stringify(seriesCache)); } catch { } }
+}
+async function fetchSeriesAny(sym, interval) {
+  if (S.settings.provider === 'twelvedata') {
+    const iv = { '5min': '5min', daily: '1day', weekly: '1week', monthly: '1month' }[interval];
+    const j = await td('time_series', { symbol: sym, interval: iv, outputsize: { '5min': 120, daily: 300, weekly: 530, monthly: 130 }[interval] });
+    return (j.values || []).map(v => [v.datetime, +v.close, +v.open, +v.high, +v.low]).reverse();
+  }
+  const fn = { '5min': 'TIME_SERIES_INTRADAY', daily: 'TIME_SERIES_DAILY', weekly: 'TIME_SERIES_WEEKLY', monthly: 'TIME_SERIES_MONTHLY' }[interval];
+  const params = { symbol: sym };
+  if (interval === '5min') { params.interval = '5min'; params.outputsize = 'compact'; }
+  if (interval === 'daily') params.outputsize = 'compact';
+  const j = await av(fn, params);
+  const key = Object.keys(j).find(k => k !== 'Meta Data' && typeof j[k] === 'object');
+  if (!key) throw new Error('réponse vide');
+  return Object.entries(j[key]).map(([d, v]) => [d, +v['4. close'], +v['1. open'], +v['2. high'], +v['3. low']]).sort((x, y) => x[0] < y[0] ? -1 : 1);
+}
+function chartTarget() {
+  const c = S.settings.chartSel || {};
+  if (c.assetId) { const a = assetById(c.assetId); if (a) return { asset: a, sym: a.symbol, name: nm(a), ccy: a.ccy }; }
+  if (c.sym) return { asset: null, sym: c.sym, name: c.name || c.sym, ccy: c.ccy || '' };
+  const first = S.assets.find(a => compute().by[a.id].qty > 0) || S.assets[0];
+  if (first) return { asset: first, sym: first.symbol, name: nm(first), ccy: first.ccy };
+  return { asset: null, sym: 'SPY', name: PRESETS[0][1], ccy: 'USD' };
+}
+async function loadChartRows(t, range) {
+  const key = S.settings.provider === 'twelvedata' ? S.settings.tdKey : S.settings.avKey;
+  const local = t.asset ? (t.asset.hist || []) : [];
+  const canFetch = !!(t.sym && key && (!t.asset || t.asset.source !== 'manuel'));
+  const get = async (interval, maxAge) => {
+    const k = (S.settings.provider || 'av') + '|' + t.sym + '|' + interval, c = cacheGet(k, maxAge);
+    if (c) return c;
+    const rows = await fetchSeriesAny(t.sym, interval); cacheSet(k, rows); return rows;
+  };
+  if (range === '1J') {
+    if (canFetch) {
+      try {
+        const rows = await get('5min', 15 * 60000);
+        const lastDay = rows.length ? rows[rows.length - 1][0].slice(0, 10) : null;
+        return { rows: rows.filter(r => r[0].slice(0, 10) === lastDay), unit: 'heure', note: 'Cours toutes les 5 minutes (dernière séance disponible).' };
+      } catch (e) { if (!t.asset) throw e; }
+    }
+    const intr = (t.asset && t.asset.intraday) || [];
+    if (intr.length >= 2) return { rows: intr.map(p => [p[0], p[1]]), unit: 'heure', note: 'Points relevés par le relais Google pendant que l\'app était ouverte aujourd\'hui.' };
+    throw new Error(t.asset && t.asset.source === 'manuel' ? 'Pas de cours intrajournaliers pour un titre saisi à la main ou de simulation.' : 'Pas encore de cours de la journée : laisse l\'app ouverte avec le relais Google, ou utilise une clé couvrant ce titre en intrajournalier (souvent seulement les titres américains en gratuit).');
+  }
+  const need = { '1S': 6, '1M': 23, '1A': 253 }[range];
+  if (range !== '10A') {
+    if (local.length >= need || (!canFetch && local.length)) return { rows: local.slice(-need), unit: 'jour', note: local.length < need ? `Historique disponible : ${local.length} jours.` : '' };
+    if (!canFetch) throw new Error(key ? 'Ce titre n\'a pas de symbole pour les cours automatiques.' : 'Ajoute une clé Alpha Vantage (⚙️ Paramètres) pour charger l\'historique.');
+    if (range === '1A' && S.settings.provider !== 'twelvedata') return { rows: (await get('weekly', 864e5)).slice(-53), unit: 'semaine', note: 'Une bougie par semaine (l\'historique quotidien gratuit couvre 100 jours).' };
+    return { rows: (await get('daily', 6 * 3600e3)).slice(-need), unit: 'jour', note: '' };
+  }
+  if (canFetch) return { rows: (await get('monthly', 7 * 864e5)).slice(-121), unit: 'mois', note: 'Une bougie par mois.' };
+  if (local.length) return { rows: local, unit: 'jour', note: `Historique disponible : ${local.length} jours seulement (titre sans cours automatiques).` };
+  throw new Error('Ajoute une clé Alpha Vantage (⚙️ Paramètres) pour charger 10 ans d\'historique.');
+}
+function fmtX(d, unit) {
+  if (unit === 'heure') return d.slice(11, 16);
+  if (unit === 'mois') return d.slice(5, 7) + '/' + d.slice(0, 4);
+  return d.slice(8, 10) + '/' + d.slice(5, 7) + '/' + d.slice(2, 4);
+}
+function drawOHLC(id, rows, mode, unit) {
+  const candles = mode === 'bougies' && rows.some(r => r.length >= 5 && r[2] > 0);
+  const up = r => r.length < 5 || !(r[2] > 0) || r[1] >= r[2], col = r => up(r) ? '#16a34a' : '#dc2626';
+  const cl = rows.map(r => r[1]);
+  const ds = candles ? [
+    { type: 'bar', label: 'Mèches', data: rows.map(r => r.length >= 5 && r[3] > 0 ? [r[4], r[3]] : null), backgroundColor: rows.map(col), barThickness: 1, grouped: false, order: 3 },
+    { type: 'bar', label: 'Cours', data: rows.map(r => { const o = r.length >= 5 && r[2] > 0 ? r[2] : r[1], c = r[1], lo = Math.min(o, c), hi = Math.max(o, c); return [lo, hi === lo ? hi * 1.0005 : hi]; }), backgroundColor: rows.map(col), barPercentage: .8, categoryPercentage: 1, grouped: false, order: 2 }
+  ] : [{ type: 'line', label: 'Cours', data: cl, borderColor: '#1d4e89', backgroundColor: 'rgba(29,78,137,.08)', fill: true, pointRadius: rows.length < 40 ? 2 : 0, tension: .1, order: 2 }];
+  if (rows.length >= 40 && unit !== 'heure') ds.push({ type: 'line', label: 'Moyenne 20 périodes', data: rollingSma(cl, 20), borderColor: '#f59e0b', pointRadius: 0, borderWidth: 1, order: 1 });
+  mkChart(id, {
+    type: candles ? 'bar' : 'line', data: { labels: rows.map(r => fmtX(r[0], unit)), datasets: ds },
+    options: {
+      maintainAspectRatio: false, animation: false, interaction: { mode: 'index', intersect: false },
+      scales: { x: { ticks: { maxTicksLimit: 8 }, grid: { display: false } }, y: { beginAtZero: false } },
+      plugins: {
+        legend: { labels: { boxWidth: 12, filter: it => it.text !== 'Mèches' } },
+        tooltip: {
+          filter: it => it.dataset.label !== 'Mèches',
+          callbacks: {
+            title: items => { const r = rows[items[0].dataIndex]; return unit === 'heure' ? r[0].slice(0, 16).replace('T', ' ') : fmtDate(r[0].slice(0, 10)); },
+            label: ctx => { const r = rows[ctx.dataIndex]; if (ctx.dataset.label === 'Cours') return r.length >= 5 && r[2] > 0 ? `Ouv. ${num(r[2])} · Haut ${num(r[3])} · Bas ${num(r[4])} · Clôt. ${num(r[1])}` : 'Cours ' + num(r[1]); return ctx.dataset.label + ' : ' + num(ctx.raw); }
+          }
+        }
+      }
+    }
+  });
+}
+async function renderCharts() {
+  const el = $('#v-graphiques'); if (!el) return;
+  const c = compute(), t = chartTarget(), cs = S.settings.chartSel || {};
+  const range = S.settings.chartTabRange || '1M', mode = S.settings.chartTabMode || 'bougies';
+  const own = S.assets.filter(a => c.by[a.id].qty > 0), watch = S.assets.filter(a => !(c.by[a.id].qty > 0));
+  const optA = a => `<option value="a:${a.id}" ${t.asset && t.asset.id === a.id ? 'selected' : ''}>${esc(nm(a))}${a.symbol ? ' (' + esc(a.symbol) + ')' : ''}</option>`;
+  el.innerHTML = `<div class="card">
+    <div class="toolbar">
+      <select id="chSel" style="min-width:280px">
+        ${own.length ? `<optgroup label="Mon portefeuille">${own.map(optA).join('')}</optgroup>` : ''}
+        ${watch.length ? `<optgroup label="Surveillance et autres titres">${watch.map(optA).join('')}</optgroup>` : ''}
+        <optgroup label="Indices et références (via un ETF)">${PRESETS.map(([sy, l]) => `<option value="p:${sy}" ${!t.asset && t.sym === sy ? 'selected' : ''}>${esc(l)}</option>`).join('')}</optgroup>
+        ${!t.asset && !PRESETS.some(p => p[0] === t.sym) ? `<option value="s:${esc(t.sym)}" selected>${esc(t.name)} (${esc(t.sym)})</option>` : ''}
+      </select>
+      <input id="chSym" placeholder="Autre : nom ou symbole (ex. Tesla, BEL 20, AIR.PAR)" style="min-width:260px"><button class="btn" data-act="chsearch">🔎 Chercher</button>
+    </div>
+    <div id="chResults" class="symres"></div>
+    <div class="toolbar">
+      <div class="seg">${Object.keys(CHART_RANGES).map(r => `<button class="${r === range ? 'on' : ''}" data-act="chtr" data-v="${r}" title="${CHART_RANGES[r]}">${r}</button>`).join('')}</div>
+      <div class="seg">${[['ligne', '📈 Lignes'], ['bougies', '🕯️ Bougies']].map(([v, l]) => `<button class="${v === mode ? 'on' : ''}" data-act="chtm" data-v="${v}">${l}</button>`).join('')}</div>
+      <span class="grow"></span>
+      ${!t.asset && t.sym ? `<button class="btn sm" data-act="chwatch">+ Suivre ce titre</button>` : ''}
+      ${t.asset ? `<button class="btn sm" data-act="asset" data-id="${t.asset.id}">Fiche du titre</button>` : ''}
+    </div>
+    <h3 style="margin:6px 0 2px">${esc(t.name)} <span class="muted small">${esc(t.sym || '')} · ${CHART_RANGES[range]}</span></h3>
+    <div class="mgrid" id="chStats"></div>
+    <div class="chartbox" style="height:430px"><canvas id="chMain"></canvas><div id="chMsg" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px">Chargement…</div></div>
+    <p class="hint" id="chNote"></p>
+    <p class="small muted">Les indices (S&P 500, Nasdaq…) sont suivis via un ETF qui les réplique, en dollars : les cours gratuits ne couvrent pas les indices eux-mêmes. Cours différés. Chaque chargement consomme une requête Alpha Vantage (25 par jour) ; les historiques sont gardés en mémoire (15 min à 7 jours selon la période).</p>
+  </div>`;
+  try {
+    const { rows, unit, note } = await loadChartRows(t, range);
+    if (!rows || rows.length < 2) throw new Error('Pas assez de données pour cette période.');
+    $('#chMsg').style.display = 'none';
+    drawOHLC('chMain', rows, mode, unit);
+    const first = rows[0][2] > 0 && rows[0].length >= 5 ? rows[0][2] : rows[0][1], last = rows[rows.length - 1][1];
+    const hi = Math.max(...rows.map(r => r.length >= 5 && r[3] > 0 ? r[3] : r[1])), lo = Math.min(...rows.map(r => r.length >= 5 && r[4] > 0 ? r[4] : r[1]));
+    const v = last / first - 1, ccy = t.ccy || '';
+    $('#chStats').innerHTML = `
+      <div class="m"><div class="l">Dernier cours</div><div class="v">${ccy ? money(last, ccy) : num(last)}</div></div>
+      <div class="m"><div class="l">Variation ${range}</div><div class="v ${cls(v)}">${pct(v)}</div></div>
+      <div class="m"><div class="l">Plus haut</div><div class="v">${num(hi)}</div></div>
+      <div class="m"><div class="l">Plus bas</div><div class="v">${num(lo)}</div></div>
+      <div class="m"><div class="l">Du</div><div class="v">${unit === 'heure' ? rows[0][0].slice(11, 16) : fmtDate(rows[0][0].slice(0, 10))}</div></div>
+      <div class="m"><div class="l">Au</div><div class="v">${unit === 'heure' ? rows[rows.length - 1][0].slice(11, 16) : fmtDate(rows[rows.length - 1][0].slice(0, 10))}</div></div>`;
+    $('#chNote').textContent = note || '';
+  } catch (e) {
+    if (charts.chMain) { charts.chMain.destroy(); delete charts.chMain; }
+    $('#chMsg').textContent = '⚠️ ' + (e.message === 'NOKEY' || /NOKEY/.test(e.message) ? 'Ajoute une clé Alpha Vantage dans ⚙️ Paramètres pour charger cet historique.' : explainErr(e) + (/LIMIT|PREMIUM/.test(e.message) ? ' — ' + (e.message.split(':').slice(1).join(':').slice(0, 160)) : ''));
+  }
 }
 
 /* ---------- Onglet Répartition ---------- */
@@ -1633,6 +1792,23 @@ document.addEventListener('click', async e => {
     case 'tab': closeModal(); showTab(b.dataset.tab); break;
     case 'refresh': if (S.settings.gsUrl) pollQuotes(true); refreshPrices(!!(S.settings.avKey || S.settings.tdKey) || !S.settings.gsUrl); break;
     case 'gsscript': showGsScript(); break;
+    case 'chtr': S.settings.chartTabRange = b.dataset.v; persist(); renderCharts(); break;
+    case 'chtm': S.settings.chartTabMode = b.dataset.v; persist(); renderCharts(); break;
+    case 'chsearch': {
+      const q = $('#chSym').value.trim(); if (!q) return toast('Tape un nom ou un symbole.', 'err');
+      $('#chResults').innerHTML = '<span class="small muted">Recherche…</span>';
+      try {
+        const res = await searchSymbol(q);
+        $('#chResults').innerHTML = res.length ? res.slice(0, 12).map(r => `<button type="button" data-act="chpick" data-sym="${esc(r.symbol)}" data-name="${esc(r.name)}" data-ccy="${esc(r.ccy)}"><b>${esc(r.symbol)}</b> — ${esc(r.name)} <span class="muted">· ${esc(r.exch)} · ${esc(r.ccy)} · ${esc(r.type)}</span></button>`).join('') : '<span class="small muted">Aucun résultat. Essaie le nom anglais, ou directement le symbole.</span>';
+      } catch (err) { $('#chResults').innerHTML = `<span class="small neg">Recherche impossible : ${esc(explainErr(err))}</span>`; }
+      break;
+    }
+    case 'chpick': S.settings.chartSel = { sym: b.dataset.sym, name: b.dataset.name, ccy: (b.dataset.ccy || '').toUpperCase() }; persist(); renderCharts(); break;
+    case 'chwatch': {
+      const t = chartTarget(); if (!t.sym) break;
+      const a = { id: uid(), created: Date.now(), symbol: t.sym, name: t.name, isin: '', type: 'action', ccy: CCYS.includes(t.ccy) ? t.ccy : 'USD', sector: '', region: guessRegion(t.sym), source: 'auto', watch: true, note: '', hist: [] };
+      S.assets.push(a); S.settings.chartSel = { assetId: a.id }; save(); gsSoon(); renderCharts(); toast('Ajouté à la surveillance : complète sa fiche (type, classe, secteur).'); break;
+    }
     case 'splitdim': S.settings.splitDim = b.dataset.v; persist(); renderRepartition(); break;
     case 'chmode': S.settings.chartMode = b.dataset.v; persist(); openAsset(id); break;
     case 'chrange': S.settings.chartRange = b.dataset.v; persist(); openAsset(id); break;
@@ -1717,6 +1893,11 @@ document.addEventListener('change', e => {
   if (t.id === 'allocBy') { S.settings.allocBy = t.value; persist(); renderOverview(); }
   else if (t.id === 'showClosed') { S.settings.showClosed = t.checked; persist(); renderPositions(); }
   else if (t.id === 'posGroup') { S.settings.posGroup = t.value; persist(); renderPositions(); }
+  else if (t.id === 'chSel') {
+    const [k, v] = t.value.split(':');
+    S.settings.chartSel = k === 'a' ? { assetId: v } : k === 'p' ? { sym: v, name: (PRESETS.find(p => p[0] === v) || [])[1], ccy: 'USD' } : (S.settings.chartSel || {});
+    persist(); renderCharts();
+  }
   else if (t.id === 'splitSel') { S.settings.splitDim = t.value; persist(); renderRepartition(); }
   else if (t.id === 'splitCash') { S.settings.splitCash = t.checked; persist(); renderRepartition(); }
   else if (t.id === 'aType' && !$('#aCls').dataset.touched) { $('#aCls').value = defaultClass(t.value); }
@@ -1751,7 +1932,7 @@ document.addEventListener('keydown', e => {
 /* ---------------------------- Démarrage ---------------------------- */
 (async function init() {
   const t = (location.hash || '').slice(1);
-  if (['overview', 'positions', 'repartition', 'transactions', 'analyse', 'alertes', 'parametres', 'bases'].includes(t)) currentTab = t;
+  if (['overview', 'positions', 'repartition', 'graphiques', 'transactions', 'analyse', 'alertes', 'parametres', 'bases'].includes(t)) currentTab = t;
   showTab(currentTab);
   try { tonioDir = (await IDB.get('tonioDir')) || null; coffreDir = (await IDB.get('coffreDir')) || null; } catch { tonioDir = null; coffreDir = null; }
   if (S.settings.autoTonio && (tonioDir || coffreDir)) saveAll(false);
