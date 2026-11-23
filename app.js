@@ -5,7 +5,7 @@
    Seuls les symboles boursiers sont envoyés au fournisseur de cours choisi.
    ===================================================================== */
 
-const APP_VERSION = 'V1.2';
+const APP_VERSION = 'V1.3';
 const LS_KEY = 'mon_portefeuille_bourse_v1';
 const CG_EXEMPTION = 10000; // exonération annuelle taxe plus-values (2026)
 
@@ -483,7 +483,7 @@ document.addEventListener('visibilitychange', () => {
 const GS_SCRIPT = [
   "/**",
   " * @OnlyCurrentDoc",
-  " * Mon Portefeuille - relais de cours Google Finance (V2)",
+  " * Mon Portefeuille - relais de cours Google Finance (V3 : photo des cours du matin pour Tonio)",
   " * Le script n'a accès qu'à CETTE feuille Google Sheets, rien d'autre dans ton Drive.",
   " * L'app ajoute et retire elle-même les titres : inutile de modifier la feuille à la main.",
   " */",
@@ -554,6 +554,51 @@ const GS_SCRIPT = [
   "      };",
   "    });",
   "    return { quotes: res, added: add, at: new Date().toISOString() };",
+  "  } finally { lock.releaseLock(); }",
+  "}",
+  "",
+  "/* ------------------------------------------------------------------------------------------",
+  " * Photo des cours du matin (V3) : chaque jour vers 6 h, même si l'app est fermée,",
+  " * le script recalcule les cours et les recopie (valeurs figées) dans l'onglet « Matin ».",
+  " * Le journal du matin de Tonio lit cet onglet pour réévaluer le portefeuille.",
+  " * ------------------------------------------------------------------------------------------ */",
+  "",
+  "/** À lancer UNE fois (▶ Exécuter) : programme la photo chaque jour vers 6 h. */",
+  "function installerMatin() {",
+  "  ScriptApp.getProjectTriggers()",
+  "    .filter(function (t) { return t.getHandlerFunction() === 'photoDuMatin'; })",
+  "    .forEach(function (t) { ScriptApp.deleteTrigger(t); });",
+  "  ScriptApp.newTrigger('photoDuMatin').timeBased().everyDays(1).atHour(6).nearMinute(0).inTimezone('Europe/Brussels').create();",
+  "  photoDuMatin();",
+  "  Logger.log('Photo des cours programmée chaque jour vers 6 h (heure de Bruxelles).');",
+  "}",
+  "",
+  "/** Lancé automatiquement vers 6 h ; peut aussi être lancé à la main pour tester. */",
+  "function photoDuMatin() {",
+  "  const ss = SpreadsheetApp.getActive(), src = sheet_(), tz = ss.getSpreadsheetTimeZone();",
+  "  const lock = LockService.getScriptLock(); lock.waitLock(30000);",
+  "  try {",
+  "    const last = src.getLastRow();",
+  "    if (last > 1) {   // forcer un recalcul des formules GOOGLEFINANCE",
+  "      const rng = src.getRange(2, 2, last - 1, COLS.length), f = rng.getFormulas();",
+  "      rng.clearContent(); SpreadsheetApp.flush(); rng.setFormulas(f); SpreadsheetApp.flush();",
+  "      for (let i = 0; i < 15; i++) {",
+  "        const d = src.getDataRange().getDisplayValues();",
+  "        if (!d.some(function (r) { const t = r.join(''); return t.indexOf('Loading') > -1 || t.indexOf('Chargement') > -1; })) break;",
+  "        Utilities.sleep(1000);",
+  "      }",
+  "    }",
+  "    const v = src.getDataRange().getValues();",
+  "    const rows = v.slice(1).filter(function (r) { return r[0] && typeof r[1] === 'number'; }).map(function (r) {",
+  "      return [String(r[0]), r[1], typeof r[2] === 'number' ? r[2] : '',",
+  "              r[3] instanceof Date ? Utilities.formatDate(r[3], tz, 'yyyy-MM-dd HH:mm') : '', r[4] || ''];",
+  "    });",
+  "    const out = ss.getSheetByName('Matin') || ss.insertSheet('Matin');",
+  "    out.clearContents();",
+  "    out.getRange(1, 1, 1, 2).setValues([['Photo du', Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm')]]);",
+  "    out.getRange(2, 1, 1, 5).setValues([['Symbole', 'Cours', 'Clôture veille', 'Heure du cours', 'Devise']]);",
+  "    if (rows.length) out.getRange(3, 1, rows.length, 5).setValues(rows);",
+  "    Logger.log(rows.length + ' cours photographiés.');",
   "  } finally { lock.releaseLock(); }",
   "}"
 ].join('\n');
@@ -1444,6 +1489,7 @@ function buildTonio() {
       data: {
         symbole: a.symbol || null, isin: a.isin || null, classe_actif: CLASSES[assetClass(a)], instrument: TYPES[a.type] || null,
         region: a.region || null, secteur: a.sector || null, devise: a.ccy, poids: r4(p.weight),
+        symbole_google: googleSym(a) || null, cours: a.price ?? null, date_cours: a.priceDate || null,
         plus_value_latente_pct: r4(p.pctLatent), variation_jour_pct: p.dayPct != null ? r4(p.dayPct) : null,
         perf_1m: r4(L.I.perf1m), perf_3m: r4(L.I.perf3m), rsi: L.I.rsi != null ? r2(L.I.rsi) : null,
         lecture: L.label, points: L.pts.map(x => x.m.replace(/<[^>]+>/g, ''))
