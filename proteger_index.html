@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protéger index.html — Mon Portefeuille</title>
+<style>
+  body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#f3f6fa;color:#1e293b;margin:0;padding:30px 16px}
+  .box{max-width:620px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:24px}
+  h1{font-size:20px;margin:0 0 6px}
+  p,li{font-size:14px;line-height:1.5}
+  label{display:block;font-size:13px;font-weight:600;color:#475569;margin:14px 0 4px}
+  input[type=password],input[type=file]{width:100%;box-sizing:border-box;padding:9px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}
+  button{margin-top:18px;background:#1d4e89;color:#fff;border:0;border-radius:8px;padding:11px 16px;font-size:15px;cursor:pointer;width:100%}
+  button:disabled{opacity:.5}
+  .msg{margin-top:14px;padding:10px 12px;border-radius:8px;font-size:14px;display:none}
+  .ok{background:#e6f4ea;color:#14532d;display:block}
+  .err{background:#fdecec;color:#9b1c1c;display:block}
+  .note{background:#fff8e6;border:1px solid #f6d58e;border-radius:8px;padding:10px 12px;font-size:13px;margin-top:16px}
+  code{background:#eef2f7;padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>🔒 Protéger <code>index.html</code> par mot de passe</h1>
+  <p>Cet outil chiffre la page de l'app (AES-256) avec ton mot de passe. Tout se passe dans ce navigateur : rien n'est envoyé sur Internet. Tu obtiens un nouveau <code>index.html</code> à mettre sur GitHub à la place de l'original.</p>
+
+  <label>1. Le fichier <code>index.html</code> d'origine</label>
+  <input type="file" id="file" accept=".html,text/html">
+
+  <label>2. Mot de passe (au moins 10 caractères)</label>
+  <input type="password" id="pw1" autocomplete="new-password">
+  <label>3. Confirme le mot de passe</label>
+  <input type="password" id="pw2" autocomplete="new-password">
+
+  <button id="go">Créer l'index.html protégé</button>
+  <div id="msg" class="msg"></div>
+
+  <div class="note">
+    <b>À savoir</b>
+    <ul>
+      <li>Garde l'<code>index.html</code> d'origine sur ton PC (pas sur GitHub) : il te servira pour les mises à jour.</li>
+      <li>Mot de passe oublié = il suffit de reprotéger l'original avec un nouveau mot de passe. Tes données de portefeuille ne sont pas touchées : elles restent dans chaque navigateur.</li>
+      <li>La protection bloque l'accès à l'app. Les fichiers <code>app.js</code> et <code>style.css</code> restent lisibles sur GitHub, mais ils ne contiennent ni tes données ni tes clés.</li>
+      <li>Ne mets jamais ce mot de passe dans un chat, ni dans le dépôt.</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const b64 = buf => { let s = ''; new Uint8Array(buf).forEach(b => s += String.fromCharCode(b)); return btoa(s); };
+const ITER = 300000;
+
+function protectedPage(D) {
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Mon Portefeuille</title>
+<style>
+  body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:linear-gradient(135deg,#0f2a4a,#1d4e89);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}
+  form{background:#fff;border-radius:16px;padding:28px 24px;width:100%;max-width:360px;box-shadow:0 10px 30px rgba(0,0,0,.25);text-align:center}
+  h1{font-size:22px;margin:6px 0 4px;color:#0f2a4a}
+  p{color:#64748b;font-size:14px;margin:0 0 18px}
+  input[type=password]{width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:10px;font-size:16px}
+  label{display:flex;gap:8px;align-items:center;justify-content:center;font-size:13px;color:#475569;margin:12px 0}
+  button{width:100%;background:#1d4e89;color:#fff;border:0;border-radius:10px;padding:12px;font-size:16px;cursor:pointer}
+  #e{color:#c62828;font-size:14px;min-height:20px;margin-top:10px}
+</style>
+</head>
+<body>
+<form id="f" autocomplete="off">
+  <div style="font-size:34px">📈</div>
+  <h1>Mon Portefeuille</h1>
+  <p>Page protégée</p>
+  <input type="password" id="p" placeholder="Mot de passe" autofocus autocomplete="current-password">
+  <label><input type="checkbox" id="r" checked> Se souvenir sur cet appareil</label>
+  <button type="submit">Ouvrir</button>
+  <div id="e"></div>
+</form>
+<script>
+(function(){
+  var D = ${JSON.stringify(D)};
+  var KEY = 'mp_cle_' + D.salt.slice(0, 12);
+  function bytes(s){ return Uint8Array.from(atob(s), function(c){ return c.charCodeAt(0); }); }
+  function b64(buf){ var s=''; new Uint8Array(buf).forEach(function(b){ s+=String.fromCharCode(b); }); return btoa(s); }
+  function derive(pw){
+    return crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']).then(function(k){
+      return crypto.subtle.deriveKey({name:'PBKDF2', salt:bytes(D.salt), iterations:D.it, hash:'SHA-256'}, k, {name:'AES-GCM', length:256}, true, ['decrypt']);
+    });
+  }
+  function openWith(key){
+    return crypto.subtle.decrypt({name:'AES-GCM', iv:bytes(D.iv)}, key, bytes(D.ct)).then(function(pt){
+      var html = new TextDecoder().decode(pt);
+      document.open(); document.write(html); document.close();
+    });
+  }
+  function err(t){ document.getElementById('e').textContent = t; }
+  if (!window.crypto || !crypto.subtle) { err('Navigateur trop ancien ou page non sécurisée (https requis).'); return; }
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved) {
+      crypto.subtle.importKey('raw', bytes(saved), {name:'AES-GCM'}, false, ['decrypt'])
+        .then(openWith)
+        .catch(function(){ try { localStorage.removeItem(KEY); } catch(e){} });
+    }
+  } catch (e) {}
+  document.getElementById('f').addEventListener('submit', function(ev){
+    ev.preventDefault(); err('Vérification…');
+    var remember = document.getElementById('r').checked;
+    derive(document.getElementById('p').value).then(function(key){
+      return crypto.subtle.decrypt({name:'AES-GCM', iv:bytes(D.iv)}, key, bytes(D.ct)).then(function(){
+        if (remember) return crypto.subtle.exportKey('raw', key).then(function(raw){ try { localStorage.setItem(KEY, b64(raw)); } catch(e){} return key; });
+        return key;
+      });
+    }).then(openWith).catch(function(){ err('Mot de passe incorrect.'); });
+  });
+})();
+<\/script>
+</body>
+</html>`;
+}
+
+$('go').addEventListener('click', async () => {
+  const msg = $('msg'); msg.className = 'msg';
+  const show = (t, ok) => { msg.textContent = t; msg.className = 'msg ' + (ok ? 'ok' : 'err'); };
+  const f = $('file').files[0], pw = $('pw1').value;
+  if (!f) return show('Choisis le fichier index.html d\'origine.');
+  if (pw.length < 10) return show('Le mot de passe doit faire au moins 10 caractères.');
+  if (pw !== $('pw2').value) return show('Les deux mots de passe ne sont pas identiques.');
+  const html = await f.text();
+  if (/id="f" autocomplete="off"/.test(html) && /mp_cle_/.test(html)) return show('Ce fichier est déjà protégé : choisis l\'index.html d\'origine.');
+  if (!/app\.js/.test(html)) return show('Ce fichier ne ressemble pas à l\'index.html de Mon Portefeuille.');
+  $('go').disabled = true; show('Chiffrement…', true);
+  try {
+    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: ITER, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(html));
+    const out = protectedPage({ salt: b64(salt), iv: b64(iv), ct: b64(ct), it: ITER });
+    const blob = new Blob([out], { type: 'text/html' }), a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'index.html'; document.body.appendChild(a); a.click(); a.remove();
+    $('pw1').value = ''; $('pw2').value = '';
+    show('✅ index.html protégé téléchargé (dossier Téléchargements). Mets-le sur GitHub à la place de l\'original.', true);
+  } catch (e) { show('Erreur : ' + e.message); }
+  $('go').disabled = false;
+});
+</script>
+</body>
+</html>
