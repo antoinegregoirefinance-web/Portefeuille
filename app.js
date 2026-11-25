@@ -1,3 +1,92 @@
+/* ============================================================================
+   TONIO — LIENS PROFONDS (module commun aux apps d'Antoine, v1.0)
+   ----------------------------------------------------------------------------
+   L'Accueil Tonio ouvre une app avec une adresse du type
+       https://…/app/#tonio=<identifiant>@<vue>
+   (identifiant = celui de l'export Tonio : task:…, deadline:…, gl:C001:…).
+   Ce module lit cette adresse le plus tôt possible, l'efface aussitôt de la
+   barre d'adresse, attend que l'app soit déverrouillée et chargée, puis
+   demande à l'app (fonction go) d'ouvrir le bon onglet et de surligner
+   l'élément. Rien n'est envoyé nulle part ; la cible est gardée au plus
+   15 minutes dans la session de l'onglet (utile si un code est demandé).
+   ============================================================================ */
+const TonioLien = (() => {
+  'use strict';
+  const K = 'tonio_lien', TTL = 15 * 60000;
+  let cible = null, cfg = null, enCours = false;
+  const lire = () => {
+    try {
+      const m = /(?:^#|&)tonio=([^&]*)/.exec(location.hash || '');
+      if (m) {
+        cible = decodeURIComponent(m[1]);
+        try { sessionStorage.setItem(K, JSON.stringify({ c: cible, t: Date.now() })); } catch (e) { /* */ }
+        history.replaceState(null, '', location.pathname + location.search);
+        return true;
+      }
+    } catch (e) { /* */ }
+    return false;
+  };
+  if (!lire()) {
+    try { const s = JSON.parse(sessionStorage.getItem(K) || 'null'); if (s && Date.now() - s.t < TTL) cible = s.c; else sessionStorage.removeItem(K); } catch (e) { /* */ }
+  }
+  // L'Accueil réutilise l'onglet de l'app : seule la partie « # » change, sans rechargement.
+  window.addEventListener('hashchange', () => { if (lire() && cfg) lancer(); }, true);
+
+  const pause = ms => new Promise(r => setTimeout(r, ms));
+  function style() {
+    if (document.getElementById('tonio-lien-css')) return;
+    const s = document.createElement('style'); s.id = 'tonio-lien-css';
+    s.textContent = `.tonio-hl{outline:3px solid #f3c64b!important;outline-offset:2px;background-color:rgba(255,236,150,.55)!important;transition:background-color .6s}
+      .tonio-toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:2147483000;background:#1d2b64;color:#fff;padding:9px 16px;border-radius:10px;font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.25);max-width:90vw}`;
+    (document.head || document.documentElement).appendChild(s);
+  }
+  function toast(msg) {
+    style();
+    const d = document.createElement('div'); d.className = 'tonio-toast'; d.textContent = msg;
+    document.body.appendChild(d); setTimeout(() => d.remove(), 4000);
+  }
+  function surligner(el) {
+    if (!el) return false;
+    style();
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.classList.add('tonio-hl'); setTimeout(() => el.classList.remove('tonio-hl'), 7000);
+    return true;
+  }
+  /** Attend qu'un élément existe (sélecteur CSS ou fonction qui renvoie l'élément). */
+  async function attendre(sel, ms = 6000) {
+    const t0 = Date.now();
+    for (;;) {
+      let el = null;
+      try { el = typeof sel === 'function' ? sel() : document.querySelector(sel); } catch (e) { el = null; }
+      if (el) return el;
+      if (Date.now() - t0 > ms) return null;
+      await pause(150);
+    }
+  }
+  async function lancer() {
+    if (!cible || !cfg || enCours) return;
+    enCours = true;
+    const t0 = Date.now();
+    try {
+      for (;;) {                      // attend la fin du déverrouillage / du chargement
+        let ok = false; try { ok = !!(await cfg.ready()); } catch (e) { ok = false; }
+        if (ok) break;
+        if (Date.now() - t0 > TTL) { cible = null; return; }
+        await pause(400);
+      }
+      await pause(250);
+      const ref = cible; cible = null;
+      try { sessionStorage.removeItem(K); } catch (e) { /* */ }
+      const i = ref.lastIndexOf('@'), id = i > 0 ? ref.slice(0, i) : ref, vue = i > 0 ? ref.slice(i + 1) : '';
+      let res;
+      try { res = await cfg.go(id, vue, { surligner, attendre, toast, pause }); } catch (e) { console.warn('Tonio – lien', e); res = false; }
+      toast(res === false ? 'Ouvert depuis l’Accueil Tonio : élément introuvable (supprimé ou renommé ?).' : '📍 Ouvert depuis l’Accueil Tonio');
+    } finally { enCours = false; if (cible) lancer(); }
+  }
+  function init(c) { cfg = c; lancer(); }
+  return { init, surligner, attendre, toast };
+})();
+
 'use strict';
 /* =====================================================================
    Mon Portefeuille — suivi de placements en bourse (V1.0)
@@ -5,7 +94,7 @@
    Seuls les symboles boursiers sont envoyés au fournisseur de cours choisi.
    ===================================================================== */
 
-const APP_VERSION = 'V1.3';
+const APP_VERSION = 'V1.4';
 const LS_KEY = 'mon_portefeuille_bourse_v1';
 const CG_EXEMPTION = 10000; // exonération annuelle taxe plus-values (2026)
 
@@ -1989,3 +2078,20 @@ document.addEventListener('keydown', e => {
   setupPolling();
   if (S.settings.gsUrl && +S.settings.gsEvery > 0) pollQuotes(false);
 })();
+
+/* ---------- Tonio : liens profonds vers Mon Portefeuille ---------- */
+TonioLien.init({
+  ready: () => typeof showTab === 'function' && document.readyState !== 'loading',
+  go: async (id, vue, L) => {
+    if (id.startsWith('vue:')) { showTab(id.slice(4)); return true; }
+    let m;
+    if ((m = /^(?:pos|watch)-(.+)$/.exec(id))) { if (!assetById(m[1])) return false; if (vue) showTab(vue); openAsset(m[1]); return true; }
+    if ((m = /^move-(.+)-(\d{4}-\d{2}-\d{2})$/.exec(id))) { if (!assetById(m[1])) return false; openAsset(m[1]); return true; }
+    if ((m = /^alert-(.+)$/.exec(id))) {
+      showTab('alertes');
+      const el = await L.attendre(() => { const b = document.querySelector(`#v-alertes [data-id="${CSS.escape(m[1])}"]`); return b && b.closest('tr'); });
+      return el ? L.surligner(el) : true;
+    }
+    return false;
+  }
+});
