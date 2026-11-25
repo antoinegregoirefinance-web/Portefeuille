@@ -1,5 +1,5 @@
 /* ============================================================================
-   TONIO — LIENS PROFONDS (module commun aux apps d'Antoine, v1.0)
+   TONIO — LIENS PROFONDS (module commun aux apps Tonio, v1.0)
    ----------------------------------------------------------------------------
    L'Accueil Tonio ouvre une app avec une adresse du type
        https://…/app/#tonio=<identifiant>@<vue>
@@ -94,7 +94,7 @@ const TonioLien = (() => {
    Seuls les symboles boursiers sont envoyés au fournisseur de cours choisi.
    ===================================================================== */
 
-const APP_VERSION = 'V1.4';
+const APP_VERSION = 'V1.9';
 const LS_KEY = 'mon_portefeuille_bourse_v1';
 const CG_EXEMPTION = 10000; // exonération annuelle taxe plus-values (2026)
 
@@ -447,7 +447,7 @@ function explainErr(e) {
   if (m === 'Failed to fetch') return 'connexion impossible';
   return m;
 }
-function needsPrice(a, c) { return a.symbol && a.source !== 'manuel' && (a.watch || c.by[a.id].qty > 0 || S.alerts.some(x => x.assetId === a.id && x.active)); }
+function needsPrice(a, c) { return a.symbol && a.source !== 'manuel' && (a.watch || a.analyse || c.by[a.id].qty > 0 || S.alerts.some(x => x.assetId === a.id && x.active)); }
 
 async function refreshPrices(force) {
   if (busy) return;
@@ -526,10 +526,12 @@ async function gsCall(params) {
 async function pollQuotes(manual) {
   if (!S.settings.gsUrl || polling) return;
   const c = compute();
-  const list = S.assets.filter(a => (a.watch || c.by[a.id].qty > 0 || S.alerts.some(x => x.assetId === a.id && x.active)) && googleSym(a));
+  const list = S.assets.filter(a => (a.watch || a.analyse || c.by[a.id].qty > 0 || S.alerts.some(x => x.assetId === a.id && x.active)) && googleSym(a));
   polling = true;
   try {
-    const j = await gsCall({ action: 'quotes', sync: '1', symbols: [...new Set(list.map(googleSym))].join(',') });
+    const j = await gsCall({ action: 'quotes', sync: '1', symbols: [...new Set([...list.map(googleSym), 'INDEXCBOE:VIX'])].join(',') });
+    const vq = (j.quotes || {})['INDEXCBOE:VIX'];
+    if (vq && vq.price > 0) { const C = S.climate = S.climate || {}; C.vix = vq.price; C.vixAt = new Date().toISOString(); C.vixHi52 = vq.high52 || null; C.vixLo52 = vq.low52 || null; const d = (vq.time || '').slice(0, 10) || today(); C.hist = (C.hist || []).filter(x => x[0] !== d).concat([[d, vq.price]]).slice(-400); }
     if (manual && !list.length) toast('Aucun titre suivi : la feuille Google a été vidée.');
     let n = 0; const miss = [];
     list.forEach(a => {
@@ -545,6 +547,7 @@ async function pollQuotes(manual) {
       a.priceTime = q.time || null;
       if (q.high52 > 0) a.hi52 = q.high52;
       if (q.low52 > 0) a.lo52 = q.low52;
+      if ([q.mcap, q.pe, q.eps, q.beta].some(x => x != null)) a.gf = { mcap: q.mcap ?? null, pe: q.pe ?? null, eps: q.eps ?? null, beta: q.beta ?? null, at: new Date().toISOString() };
       n++;
     });
     S.settings.lastPoll = Date.now();
@@ -572,13 +575,13 @@ document.addEventListener('visibilitychange', () => {
 const GS_SCRIPT = [
   "/**",
   " * @OnlyCurrentDoc",
-  " * Mon Portefeuille - relais de cours Google Finance (V3 : photo des cours du matin pour Tonio)",
+  " * Mon Portefeuille - relais de cours Google Finance (V5 : + capitalisation, PER, BPA, bêta ; séries officielles de la BCE pour Projections)",
   " * Le script n'a accès qu'à CETTE feuille Google Sheets, rien d'autre dans ton Drive.",
   " * L'app ajoute et retire elle-même les titres : inutile de modifier la feuille à la main.",
   " */",
   "const TOKEN = 'CHANGE-MOI'; // ton code, à recopier dans l'app (Paramètres)",
-  "const COLS = ['price', 'closeyest', 'tradetime', 'currency', 'high52', 'low52', 'priceopen', 'high', 'low'];",
-  "const HEAD = ['Symbole', 'Cours', 'Clôture veille', 'Heure', 'Devise', 'Haut 52s', 'Bas 52s', 'Ouverture', 'Haut jour', 'Bas jour'];",
+  "const COLS = ['price', 'closeyest', 'tradetime', 'currency', 'high52', 'low52', 'priceopen', 'high', 'low', 'marketcap', 'pe', 'eps', 'beta'];",
+  "const HEAD = ['Symbole', 'Cours', 'Clôture veille', 'Heure', 'Devise', 'Haut 52s', 'Bas 52s', 'Ouverture', 'Haut jour', 'Bas jour', 'Capitalisation', 'PER', 'BPA', 'Bêta'];",
   "",
   "function doGet(e) {",
   "  const p = (e && e.parameter) || {};",
@@ -587,8 +590,19 @@ const GS_SCRIPT = [
   "    const list = String(p.symbols || '').split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(String);",
   "    if (p.action === 'quotes') return out_(quotes_(list, p.sync === '1'));",
   "    if (p.action === 'list') return out_({ symbols: known_() });",
-  "    return out_({ ok: true, version: 2 });",
+  "    if (p.action === 'ecb') return out_(ecb_(String(p.s || ''), String(p.start || '')));",
+  "    return out_({ ok: true, version: 5 });",
   "  } catch (err) { return out_({ error: String(err) }); }",
+  "}",
+  "",
+  "// V5 : séries publiques de la BCE (taux de la zone euro à 10 ans, euro/dollar), uniquement celles-ci",
+  "const ECB_OK = { 'YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y': 1, 'EXR/D.USD.EUR.SP00.A': 1 };",
+  "function ecb_(s, start) {",
+  "  if (!ECB_OK[s]) return { error: 'série non autorisée' };",
+  "  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(start)) start = '2020-01-01';",
+  "  const r = UrlFetchApp.fetch('https://data-api.ecb.europa.eu/service/data/' + s + '?format=csvdata&detail=dataonly&startPeriod=' + start, { muteHttpExceptions: true });",
+  "  if (r.getResponseCode() !== 200) return { error: 'BCE HTTP ' + r.getResponseCode() };",
+  "  return { csv: r.getContentText() };",
   "}",
   "",
   "function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }",
@@ -596,7 +610,7 @@ const GS_SCRIPT = [
   "function sheet_() {",
   "  const ss = SpreadsheetApp.getActive();",
   "  const sh = ss.getSheetByName('Cours') || ss.insertSheet('Cours');",
-  "  if (sh.getLastRow() < 1) sh.getRange(1, 1, 1, HEAD.length).setValues([HEAD]);",
+  "  if (sh.getLastRow() < 1 || sh.getRange(1, HEAD.length).getValue() !== HEAD[HEAD.length - 1]) sh.getRange(1, 1, 1, HEAD.length).setValues([HEAD]);",
   "  return sh;",
   "}",
   "",
@@ -623,7 +637,18 @@ const GS_SCRIPT = [
   "      sh.getRange(last, 1).setValue(s);",
   "      sh.getRange(last, 2, 1, COLS.length).setFormulas([COLS.map(function (c) { return '=IFERROR(GOOGLEFINANCE($A' + last + ',\"' + c + '\"),\"\")'; })]);",
   "    });",
-  "    if (add.length) {",
+  "    // 2 bis. V4 : compléter les lignes créées avec une version précédente (colonnes ajoutées)",
+  "    let fixes = 0;",
+  "    if (last > 1) {",
+  "      const fr = sh.getRange(2, 2, last - 1, COLS.length).getFormulas();",
+  "      fr.forEach(function (r, i) {",
+  "        if (r[COLS.length - 1]) return;",
+  "        const row = i + 2;",
+  "        sh.getRange(row, 2, 1, COLS.length).setFormulas([COLS.map(function (c) { return '=IFERROR(GOOGLEFINANCE($A' + row + ',\"' + c + '\"),\"\")'; })]);",
+  "        fixes++;",
+  "      });",
+  "    }",
+  "    if (add.length || fixes) {",
   "      SpreadsheetApp.flush();",
   "      for (let i = 0; i < 10; i++) {",
   "        const d = sh.getDataRange().getDisplayValues();",
@@ -639,7 +664,8 @@ const GS_SCRIPT = [
   "      res[r[0]] = {",
   "        price: r[1], prev: n(r[2]),",
   "        time: r[3] instanceof Date ? Utilities.formatDate(r[3], tz, \"yyyy-MM-dd'T'HH:mm\") : null,",
-  "        ccy: r[4] || null, high52: n(r[5]), low52: n(r[6]), open: n(r[7]), high: n(r[8]), low: n(r[9])",
+  "        ccy: r[4] || null, high52: n(r[5]), low52: n(r[6]), open: n(r[7]), high: n(r[8]), low: n(r[9]),",
+  "        mcap: n(r[10]), pe: n(r[11]), eps: n(r[12]), beta: n(r[13])",
   "      };",
   "    });",
   "    return { quotes: res, added: add, at: new Date().toISOString() };",
@@ -758,7 +784,7 @@ function renderHeader() {
 }
 function renderAll() { renderHeader(); renderView(currentTab); }
 function renderView(t) {
-  ({ overview: renderOverview, positions: renderPositions, repartition: renderRepartition, graphiques: renderCharts, transactions: renderTx, analyse: renderAnalyse, alertes: renderAlerts, parametres: renderSettings }[t] || (() => { }))();
+  ({ overview: renderOverview, positions: renderPositions, repartition: renderRepartition, graphiques: renderCharts, transactions: renderTx, analyse: renderAnalyse, societes: renderSocietes, projections: renderProjections, pistes: renderPistes, alertes: renderAlerts, parametres: renderSettings }[t] || (() => { }))();
 }
 function showTab(t) {
   currentTab = t;
@@ -1220,6 +1246,7 @@ function openAsset(id, preset) {
       <label>Cours<select id="aSource"><option value="auto" ${a.source !== 'manuel' ? 'selected' : ''}>Automatiques (clé API)</option><option value="manuel" ${a.source === 'manuel' ? 'selected' : ''}>Saisis à la main</option></select></label>
       <label>Symbole Google Finance (cours en direct)<input id="aGsym" value="${esc(a.gsym || '')}" placeholder="auto : ${esc(googleSym(a) || 'ex. EBR:ABI')}"></label>
       <label class="chk"><input type="checkbox" id="aWatch" ${a.watch ? 'checked' : ''}> Liste de surveillance (suivre sans posséder)</label>
+      <label class="chk"><input type="checkbox" id="aAnalyse" ${a.analyse ? 'checked' : ''}> 🔎 À analyser (page Sociétés et Projections, actions uniquement)</label>
       <label class="full">Répartition géographique détaillée (facultatif, utile pour un ETF)<input id="aRegionSplit" value="${esc(a.regionSplit || '')}" placeholder="ex. États-Unis 70; Europe 15; Japon 6; Autres 9 — voir la fiche de l'ETF"></label>
       <label class="full">Répartition sectorielle détaillée (facultatif)<input id="aSectorSplit" value="${esc(a.sectorSplit || '')}" placeholder="ex. Technologie 26; Finance 16; Santé 11; Industrie 11; Autres 36"></label>
       <label class="full">Pourquoi ce titre ? (ta « thèse », à relire avant de vendre)<textarea id="aNote">${esc(a.note || '')}</textarea></label>
@@ -1316,7 +1343,7 @@ function guessRegion(sym) {
 }
 function saveAsset(id) {
   const g = k => $('#' + k).value.trim();
-  const data = { symbol: g('aSymbol').toUpperCase(), name: g('aName'), isin: g('aIsin').toUpperCase(), type: g('aType'), ccy: g('aCcy'), sector: g('aSector'), region: g('aRegion'), source: g('aSource'), watch: $('#aWatch').checked, note: $('#aNote').value, gsym: g('aGsym').toUpperCase(), cls: g('aCls'), regionSplit: g('aRegionSplit'), sectorSplit: g('aSectorSplit') };
+  const data = { symbol: g('aSymbol').toUpperCase(), name: g('aName'), isin: g('aIsin').toUpperCase(), type: g('aType'), ccy: g('aCcy'), sector: g('aSector'), region: g('aRegion'), source: g('aSource'), watch: $('#aWatch').checked, analyse: $('#aAnalyse').checked, note: $('#aNote').value, gsym: g('aGsym').toUpperCase(), cls: g('aCls'), regionSplit: g('aRegionSplit'), sectorSplit: g('aSectorSplit') };
   if (!data.name && !data.symbol) return toast('Indique au moins un nom ou un symbole.', 'err');
   if (!data.name) data.name = data.symbol;
   if (!data.region) data.region = guessRegion(data.symbol);
@@ -1585,7 +1612,7 @@ function buildTonio() {
       }
     });
   });
-  S.assets.filter(a => a.watch && !(c.by[a.id].qty > 0)).forEach(a => {
+  S.assets.filter(a => (a.watch || a.analyse) && !(c.by[a.id].qty > 0)).forEach(a => {
     const L = lecture(a, null);
     records.push({ id: 'watch-' + a.id, type: 'surveillance', title: nm(a), date: a.priceDate || null, status: 'surveille', amount: null, currency: a.ccy, category: TYPES[a.type] || 'Autre', tags: [], data: { symbole: a.symbol, cours: a.price ?? null, lecture: L.label, points: L.pts.map(x => x.m) } });
   });
@@ -1596,6 +1623,13 @@ function buildTonio() {
   S.assets.filter(a => c.by[a.id].qty > 0 || a.watch).forEach(a => bigMoves(a, 30).forEach(m => records.push({ id: 'move-' + a.id + '-' + m.date, type: 'mouvement', title: `${nm(a)} ${pct(m.pct)}`, date: m.date, status: m.pct < 0 ? 'baisse' : 'hausse', amount: null, currency: a.ccy, category: 'Mouvement inhabituel', tags: [], data: { symbole: a.symbol || null, isin: a.isin || null, variation_pct: r4(m.pct), cloture: m.price, variation_habituelle_pct: r4(m.usual), en_portefeuille: c.by[a.id].qty > 0 } })));
   const trig = S.alerts.filter(a => a.active && a.triggeredAt).length;
   const ry = c.realizedYear[yr] || 0;
+  let pisteRecs = [], pisteCount = null;
+  try {
+    const PL = pistes(); pisteCount = {};
+    PL.forEach(x => { pisteCount[x.k] = (pisteCount[x.k] || 0) + 1; });
+    pisteRecs = PL.map(x => ({ id: 'piste-' + x.a.id, type: 'piste', title: nm(x.a), date: today(), status: x.k, amount: null, currency: x.a.ccy, category: TYPES[x.a.type] || 'Autre', tags: [],
+      data: { piste: PISTE[x.k][0], score: Math.round(x.score * 10) / 10, en_portefeuille: x.held, poids: x.held ? r4(x.p.weight) : null, symbole: x.a.symbol || null, raisons: x.pts.map(t => (t.s > 0 ? '▲ ' : t.s < 0 ? '▼ ' : '• ') + t.t), avertissement: 'Piste à étudier, pas un conseil en investissement.' } }));
+  } catch (e) { pisteRecs = []; }
   const oldest = c.open.map(p => p.asset.priceDate).filter(Boolean).sort()[0] || null;
   return {
     tonio_format: '1.0', app: 'bourse', app_version: APP_VERSION, exported_at: localISO(now),
@@ -1606,9 +1640,9 @@ function buildTonio() {
       valeur_totale: r2(c.T.value), investi: r2(c.T.cost), plus_value_latente: r2(c.T.latent), plus_value_latente_pct: r4(c.T.pctLatent),
       variation_jour: r2(c.T.day), plus_value_realisee: r2(c.T.realized), plus_value_realisee_annee: r2(ry),
       exoneration_plus_values_restante: r2(Math.max(0, CG_EXEMPTION - Math.max(0, ry))), dividendes: r2(c.T.divs),
-      liquidites: c.hasCash ? r2(c.cash) : null, nb_positions: c.open.length, alertes_declenchees: trig, cours_le_plus_ancien: oldest
+      liquidites: c.hasCash ? r2(c.cash) : null, nb_positions: c.open.length, pistes: pisteCount, alertes_declenchees: trig, cours_le_plus_ancien: oldest
     },
-    records, excluded: { private_items: S.tx.length }
+    records: records.concat(pisteRecs), excluded: { private_items: S.tx.length }
   };
 }
 const IDB = {
@@ -2064,10 +2098,973 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.target.id === 'cf1' || e.target.id === 'cf2')) { const b = document.querySelector('[data-act=coffreok]'); if (b) b.click(); }
 });
 
+
+/* ============================================================================
+   SOCIÉTÉS & PROJECTIONS (V1.5)
+   - Page « Sociétés » : les actions détenues + celles marquées « 🔎 À analyser »,
+     avec cours, performances, fondamentaux (feuille Google, Alpha Vantage ou saisie)
+   - Page « Projections » : fourchettes de prix futurs par société, 3 méthodes
+   Aucune donnée n'est envoyée ailleurs que chez les fournisseurs de cours déjà utilisés.
+   ============================================================================ */
+const isCo = a => a && a.type === 'action';
+function societes(c = compute()) {
+  return S.assets.filter(a => isCo(a) && (c.by[a.id].qty > 0 || a.analyse))
+    .sort((x, y) => (c.by[y.id].value || 0) - (c.by[x.id].value || 0) || nm(x).localeCompare(nm(y)));
+}
+const okN = v => v != null && v !== '' && !isNaN(v) && isFinite(v);
+const pick = (...v) => { for (const x of v) if (okN(x)) return +x; return null; };
+/** Fusion des sources : ta saisie > Alpha Vantage > Google Finance > calcul. */
+function fundOf(a) {
+  const g = a.gf || {}, o = a.ov || {}, m = a.fm || {}, price = a.price ?? null;
+  const eps = pick(m.eps, o.eps, g.eps);
+  const pe = pick(m.pe, o.pe, g.pe, eps > 0 && price ? price / eps : null);
+  const dy = pick(m.dy, o.dy, o.dps && price ? o.dps / price : null);
+  const src = k => (okN(m[k]) ? 'toi' : okN(o[k]) ? 'Alpha Vantage' : okN(g[k]) ? 'Google' : '');
+  return {
+    price, eps, pe, dy, fpe: pick(o.fpe), peg: pick(o.peg), pb: pick(o.pb), mcap: pick(o.mcap, g.mcap), beta: pick(o.beta, g.beta),
+    margin: pick(o.margin), roe: pick(o.roe), rev: pick(o.rev), revG: pick(o.revG), epsG: pick(m.g, o.epsG),
+    target: pick(m.target, o.target), analysts: o.analysts || null, desc: o.desc || '', industry: o.industry || '', country: o.country || '',
+    src: { eps: src('eps'), pe: okN(m.pe) ? 'toi' : okN(o.pe) ? 'Alpha Vantage' : okN(g.pe) ? 'Google' : eps > 0 && price ? 'calcul' : '', dy: src('dy'), target: src('target') },
+    ovAt: o.at || null, gfAt: g.at || null
+  };
+}
+function bigNum(v, ccy) {
+  if (!okN(v)) return '–';
+  const a = Math.abs(v), u = a >= 1e12 ? [1e12, ' T'] : a >= 1e9 ? [1e9, ' Md'] : a >= 1e6 ? [1e6, ' M'] : [1, ''];
+  return num(v / u[0], u[0] > 1 ? 1 : 0) + u[1] + (ccy ? ' ' + ccy : '');
+}
+
+/* ---------- Alpha Vantage : fiche société (1 requête, gardée 7 jours) ---------- */
+async function fetchOverview(a, manual) {
+  if (!a.symbol) return toast('Ce titre n’a pas de symbole.', 'err');
+  if (!S.settings.avKey) return toast('Ajoute ta clé Alpha Vantage gratuite dans ⚙️ Paramètres.', 'err');
+  if (!manual && a.ov && a.ov.at && Date.now() - new Date(a.ov.at).getTime() < 7 * 864e5) return;
+  try {
+    const j = await av('OVERVIEW', { symbol: a.symbol });
+    if (!j || !j.Symbol) { a.ov = Object.assign({}, a.ov, { at: new Date().toISOString(), vide: true }); save(); if (manual) toast('Alpha Vantage n’a pas de fiche pour ce symbole (fréquent hors États-Unis) : utilise « Fiche Claude » et la saisie.', 'err'); return; }
+    const f = k => { const v = parseFloat(j[k]); return isFinite(v) ? v : null; };
+    a.ov = {
+      at: new Date().toISOString(), desc: j.Description || '', industry: j.Industry || '', sector: j.Sector || '', country: j.Country || '',
+      mcap: f('MarketCapitalization'), pe: f('PERatio'), fpe: f('ForwardPE'), peg: f('PEGRatio'), eps: f('EPS'), dps: f('DividendPerShare'), dy: f('DividendYield'),
+      margin: f('ProfitMargin'), roe: f('ReturnOnEquityTTM'), rev: f('RevenueTTM'), revG: f('QuarterlyRevenueGrowthYOY'), epsG: f('QuarterlyEarningsGrowthYOY'),
+      target: f('AnalystTargetPrice'), beta: f('Beta'), pb: f('PriceToBookRatio'),
+      analysts: ['StrongBuy', 'Buy', 'Hold', 'Sell', 'StrongSell'].some(k => f('AnalystRating' + k) != null) ? ['StrongBuy', 'Buy', 'Hold', 'Sell', 'StrongSell'].map(k => f('AnalystRating' + k) || 0) : null
+    };
+    if (!a.sector && j.Sector) a.sector = j.Sector;
+    save(); if (manual) toast('Fiche Alpha Vantage chargée pour ' + nm(a) + '.');
+  } catch (e) { if (manual) toast(e.message === 'NOKEY' ? 'Ajoute ta clé Alpha Vantage dans ⚙️ Paramètres.' : 'Alpha Vantage : ' + e.message, 'err'); }
+}
+
+/* ---------- Fiche Claude : texte prêt pour Tonio ---------- */
+function companyPrompt(a) {
+  const c = compute(), p = c.by[a.id], F = fundOf(a), I = indicators(a);
+  return [
+    `Tonio, fais le point sur cette société : ${nm(a)}${a.symbol ? ' (symbole ' + a.symbol + ')' : ''}${a.isin ? ', ISIN ' + a.isin : ''}, cotée en ${a.ccy}.`,
+    p.qty > 0 ? `Je la détiens (${pctAbs(p.weight)} de mon portefeuille, ${pct(p.pctLatent)} de plus-value latente).` : 'Je ne la détiens pas : elle est dans ma liste « à analyser ».',
+    `Cours actuel ${money(F.price, a.ccy)} ; 1 an ${pct(I.perf1y)} ; PER ${F.pe != null ? num(F.pe, 1) : 'inconnu'}.`,
+    a.note ? `Ma thèse : « ${a.note} ».` : '',
+    'Cherche sur le web des informations récentes et datées, et donne-moi :',
+    '1) l’activité et le modèle économique en quelques lignes ; 2) les derniers résultats (chiffre d’affaires, marge, bénéfice par action, croissance) ;',
+    '3) la solidité du bilan (dette nette) et le dividende ; 4) la valorisation actuelle et le consensus des analystes (objectif de cours moyen, avec la date) ;',
+    '5) les catalyseurs et les principaux risques des 12 prochains mois ; 6) ce qui distingue la société de ses concurrents.',
+    'Termine par un bloc « Chiffres pour mon app » : BPA des 12 derniers mois, PER, rendement du dividende (%), croissance annuelle attendue du BPA (%), objectif moyen des analystes — chacun avec sa source et sa date.',
+    'Sépare les faits sourcés des hypothèses. Ne me dis pas d’acheter ou de vendre ; rappelle en une ligne que ce n’est pas un conseil en investissement.'
+  ].filter(Boolean).join('\n');
+}
+function openCompanyAsk(id) {
+  const a = assetById(id); if (!a) return;
+  openModal(`<h2>🤖 Fiche société avec Claude</h2>
+    <p class="small">Texte prêt pour ton projet Claude (Tonio). Clique « Copier et ouvrir Claude », colle-le (Ctrl+V), puis recopie les chiffres du bloc final dans « Mes chiffres » de la page Sociétés.</p>
+    <textarea id="askTxt" style="width:100%;min-height:260px;font-size:13px">${esc(companyPrompt(a))}</textarea>
+    <div class="modal-actions"><button class="btn primary" data-act="askgo">📋 Copier et ouvrir Claude</button><button class="btn" data-act="closemodal2">Fermer</button></div>`);
+}
+
+/* ---------- Page « Sociétés » ---------- */
+let socOpen = null;
+function renderSocietes() {
+  const c = compute(), L = societes(c), tot = c.totalValue || 0;
+  const row = a => {
+    const p = c.by[a.id], F = fundOf(a), I = indicators(a), up = F.target && F.price ? F.target / F.price - 1 : null;
+    return `<tr class="click" data-act="socopen" data-id="${a.id}">
+      <td><b>${esc(nm(a))}</b> <span class="muted small">${esc(a.symbol || '')}</span><br><span class="small muted">${esc(a.sector || F.industry || '')}</span></td>
+      <td>${p.qty > 0 ? `<span class="tag">En portefeuille · ${pctAbs(p.weight)}</span>` : '<span class="tag warn">🔎 À analyser</span>'}</td>
+      <td style="text-align:right">${money(F.price, a.ccy)}</td>
+      <td style="text-align:right" class="${cls(I.perf1y)}">${pct(I.perf1y)}</td>
+      <td style="text-align:right">${bigNum(F.mcap, a.ccy)}</td>
+      <td style="text-align:right">${F.pe != null ? num(F.pe, 1) : '–'}</td>
+      <td style="text-align:right">${F.eps != null ? num(F.eps, 2) : '–'}</td>
+      <td style="text-align:right">${F.dy != null ? pctAbs(F.dy) : '–'}</td>
+      <td style="text-align:right">${F.margin != null ? pctAbs(F.margin) : '–'}</td>
+      <td style="text-align:right" class="${cls(up)}">${F.target != null ? money(F.target, a.ccy) + `<br><span class="small">${pct(up)}</span>` : '–'}</td>
+      <td style="text-align:right">${I.vol != null ? pctAbs(I.vol) : '–'}</td></tr>`;
+  };
+  const card = a => {
+    const p = c.by[a.id], F = fundOf(a), Lc = lecture(a, p), I = Lc.I, m = a.fm || {};
+    const an = F.analysts, anTot = an ? an.reduce((s, x) => s + x, 0) : 0;
+    const inp = (k, lab, ph, val) => `<label>${lab}<input data-fm="${k}" data-id="${a.id}" inputmode="decimal" placeholder="${ph}" value="${val != null ? String(val).replace('.', ',') : ''}"></label>`;
+    return `<details class="card" id="soc-${a.id}" ${socOpen === a.id ? 'open' : ''}>
+      <summary style="cursor:pointer;list-style:none"><h3 style="margin:0;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>${esc(nm(a))} <span class="muted small">${esc(a.symbol || '')} ${a.isin ? '· ' + esc(a.isin) : ''}</span></span>
+        <span class="price-big" style="font-size:18px">${money(F.price, a.ccy)} <span class="small ${cls(p.dayPct)}">${pct(p.dayPct)}</span></span></h3></summary>
+      <div class="grid2" style="margin-top:10px">
+        <div>
+          ${F.desc ? `<p class="small">${esc(F.desc.length > 700 ? F.desc.slice(0, 700) + '…' : F.desc)}</p>` : '<p class="small muted">Pas encore de description : clique « 📥 Alpha Vantage » ou « 🤖 Fiche Claude ».</p>'}
+          <p class="small" style="margin:6px 0">${[['Secteur', a.sector || F.industry], ['Activité', F.industry], ['Pays', F.country || a.region], ['Devise', a.ccy]].filter(x => x[1]).map(x => `${x[0]} <b>${esc(x[1])}</b>`).join(' &nbsp;·&nbsp; ')}</p>
+          <div class="mgrid" style="margin-top:10px">
+            ${[['Capitalisation', bigNum(F.mcap, a.ccy)], ['PER', F.pe != null ? num(F.pe, 1) : '–'], ['PER attendu', F.fpe != null ? num(F.fpe, 1) : '–'], ['BPA (12 m)', F.eps != null ? num(F.eps, 2) : '–'],
+               ['Rend. dividende', F.dy != null ? pctAbs(F.dy) : '–'], ['Marge nette', F.margin != null ? pctAbs(F.margin) : '–'], ['ROE', F.roe != null ? pctAbs(F.roe) : '–'], ['Cours / valeur comptable', F.pb != null ? num(F.pb, 2) : '–'],
+               ['Croissance CA (a/a)', F.revG != null ? pct(F.revG) : '–'], ['Croissance BPA', F.epsG != null ? pct(F.epsG) : '–'], ['Bêta', F.beta != null ? num(F.beta, 2) : '–'], ['Volatilité (1 an)', I.vol != null ? pctAbs(I.vol) : '–']]
+              .map(([l, v]) => `<div class="m"><div class="l">${l}</div><div class="v">${v}</div></div>`).join('')}
+          </div>
+          ${F.target != null ? `<p class="small">🎯 Objectif moyen des analystes : <b>${money(F.target, a.ccy)}</b> (<span class="${cls(F.target / F.price - 1)}">${pct(F.price ? F.target / F.price - 1 : null)}</span> vs cours) <span class="muted">· source : ${F.src.target}</span>${an && anTot ? ` · avis : ${an[0] + an[1]} positifs, ${an[2]} neutres, ${an[3] + an[4]} négatifs` : ''}</p>` : ''}
+          <p class="small muted">Sources : ${[F.gfAt ? 'feuille Google ' + fmtDate(F.gfAt) : '', F.ovAt ? 'Alpha Vantage ' + fmtDate(F.ovAt) : '', Object.keys(m).length ? 'ta saisie' : ''].filter(Boolean).join(' · ') || 'aucune pour l’instant'}.</p>
+        </div>
+        <div>
+          <div class="mgrid">
+            <div class="m"><div class="l">1 mois</div><div class="v ${cls(I.perf1m)}">${pct(I.perf1m)}</div></div>
+            <div class="m"><div class="l">3 mois</div><div class="v ${cls(I.perf3m)}">${pct(I.perf3m)}</div></div>
+            <div class="m"><div class="l">1 an</div><div class="v ${cls(I.perf1y)}">${pct(I.perf1y)}</div></div>
+            <div class="m"><div class="l">RSI</div><div class="v">${I.rsi != null ? I.rsi.toFixed(0) : '–'}</div></div>
+          </div>
+          ${p.qty > 0 ? `<p class="small">Ma position : ${pctAbs(p.weight)} du portefeuille · PRU ${money(p.pru, a.ccy)} · <span class="${cls(p.latent)}">${sEur(p.latent)} (${pct(p.pctLatent)})</span></p>` : ''}
+          <div style="margin-top:6px"><span class="tag ${Lc.cls}">${Lc.label}</span></div>
+          <ul class="lect">${Lc.pts.slice(0, 4).map(x => `<li class="${x.t}">${x.m}</li>`).join('')}</ul>
+          ${(() => { const v = typeof veilleFor === 'function' ? veilleFor(a) : null; if (!v) return ''; const s = SENT[String(Math.max(-2, Math.min(2, Math.round(+v.sentiment || 0))))]; return `<p class="small">📰 <b>Veille Tonio du ${fmtDate(S.veille.date)}</b> : <span class="tag ${s[1]}">${s[0]}</span> ${esc(v.resume || '')} <a href="#" data-act="projmode" data-mode="veille" onclick="setTimeout(()=>showTab('projections'),0)">Lire</a></p>`; })()}
+          <h4 style="margin:12px 0 6px">✍️ Mes chiffres <span class="muted small">(remplacent les sources automatiques ; laisse vide pour les garder)</span></h4>
+          <div class="form-grid">
+            ${inp('eps', 'BPA 12 mois (' + a.ccy + ')', F.eps != null ? num(F.eps, 2) : 'ex. 4,20', m.eps)}
+            ${inp('pe', 'PER', F.pe != null ? num(F.pe, 1) : 'ex. 18', m.pe)}
+            ${inp('dy', 'Rendement du dividende (%)', F.dy != null ? num(F.dy * 100, 2) : 'ex. 2,5', m.dy != null ? +(m.dy * 100).toFixed(3) : null)}
+            ${inp('g', 'Croissance annuelle attendue du BPA (%)', 'ex. 7', m.g != null ? +(m.g * 100).toFixed(3) : null)}
+            ${inp('target', 'Objectif des analystes (' + a.ccy + ')', F.target != null ? num(F.target, 2) : 'ex. 120', m.target)}
+          </div>
+          <label class="small" style="display:block;margin-top:6px">Pourquoi je la regarde (ma thèse)<textarea data-fmnote="${a.id}" style="width:100%;min-height:60px">${esc(a.note || '')}</textarea></label>
+        </div>
+      </div>
+      <div class="toolbar" style="margin:10px 0 0">
+        <button class="btn sm primary" data-act="socproj" data-id="${a.id}">🔮 Projections</button>
+        <button class="btn sm" data-act="socov" data-id="${a.id}">📥 Alpha Vantage</button>
+        <button class="btn sm" data-act="socask" data-id="${a.id}">🤖 Fiche Claude</button>
+        <button class="btn sm" data-act="asset" data-id="${a.id}">Détail / graphique</button>
+        ${a.analyse ? `<button class="btn sm light" data-act="socrm" data-id="${a.id}">Retirer de « À analyser »</button>` : ''}
+      </div>
+    </details>`;
+  };
+  $('#v-societes').innerHTML = `
+    <div class="toolbar"><h3 class="grow" style="margin:0">🏢 Mes sociétés : en portefeuille et à analyser</h3>
+      <button class="btn" data-act="socadd">+ Société à analyser</button>
+      <button class="btn" data-act="socovall">📥 Fondamentaux (Alpha Vantage)</button></div>
+    <p class="disclaimer">Seules les <b>actions</b> apparaissent ici (pas les ETF, obligations ni l’or) : celles que tu détiens et celles marquées « 🔎 À analyser » (case dans la fiche du titre). Les chiffres viennent de la feuille Google (PER, BPA, capitalisation, bêta), d’Alpha Vantage (fiche complète, surtout pour les sociétés américaines) ou de ta saisie, qui l’emporte toujours. Clique une ligne pour ouvrir la fiche.</p>
+    ${L.length ? `<div class="card"><div class="tbl-wrap"><table>
+      <thead><tr><th>Société</th><th>Statut</th><th style="text-align:right">Cours</th><th style="text-align:right">1 an</th><th style="text-align:right">Capitalisation</th><th style="text-align:right">PER</th><th style="text-align:right">BPA</th><th style="text-align:right">Rend. div.</th><th style="text-align:right">Marge nette</th><th style="text-align:right">Objectif analystes</th><th style="text-align:right">Volatilité</th></tr></thead>
+      <tbody>${L.map(row).join('')}</tbody></table></div></div>
+      ${L.map(card).join('')}` : `<div class="card empty"><h2>Aucune société pour l’instant</h2><p>Ajoute une action en portefeuille, ou clique « + Société à analyser » pour en suivre une sans l’acheter.</p></div>`}`;
+  if (socOpen) { const el = document.getElementById('soc-' + socOpen); if (el) setTimeout(() => el.scrollIntoView({ block: 'start', behavior: 'smooth' }), 30); socOpen = null; }
+}
+
+/* ---------- Page « Projections » ---------- */
+const HZ = [1, 3, 5];
+function projDefaults(a) {
+  const F = fundOf(a), I = indicators(a), c = closes(a);
+  let mu = null;
+  if (c.length >= 120 && c[0] > 0) mu = Math.log(c[c.length - 1] / c[0]) / (c.length / 252);
+  else { const w = (a.weekly || []).map(x => x[1]); if (w.length >= 104 && w[0] > 0) mu = Math.log(w[w.length - 1] / w[0]) / (w.length / 52); }
+  mu = mu == null ? 0.06 : Math.max(-0.05, Math.min(0.12, mu));
+  const g = F.epsG != null ? Math.max(-0.05, Math.min(0.15, F.epsG)) : 0.06;
+  const pe = F.pe != null && F.pe > 0 ? Math.max(8, Math.min(35, F.pe)) : 15;
+  return { gP: +(g - 0.05).toFixed(3), gC: +g.toFixed(3), gO: +(g + 0.05).toFixed(3), peP: +(pe * 0.8).toFixed(1), peC: +pe.toFixed(1), peO: +(pe * 1.2).toFixed(1), mu: +mu.toFixed(3), vol: +(I.vol != null ? Math.max(0.08, Math.min(0.8, I.vol)) : 0.25).toFixed(3), h: 3 };
+}
+function projOf(a) { return Object.assign(projDefaults(a), a.proj || {}); }
+function projCalc(a) {
+  const F = fundOf(a), P = projOf(a), p0 = F.price, out = { P, F, rows: {} };
+  if (!(p0 > 0)) return out;
+  const z = 1.2816;
+  HZ.forEach(T => {
+    const r = {};
+    if (F.eps != null && F.eps > 0) {
+      const sc = (g, pe) => F.eps * Math.pow(1 + g, T) * pe;
+      r.fond = { p: sc(P.gP, P.peP), c: sc(P.gC, P.peC), o: sc(P.gO, P.peO) };
+      r.div = (F.dy || 0) * p0 * T;          // dividendes cumulés (ordre de grandeur, sans réinvestissement)
+    }
+    const cv = climVar(P.vol, T), med = p0 * Math.exp(P.mu * T - cv / 2), s = Math.sqrt(cv);
+    r.stat = { p: med * Math.exp(-z * s), c: med, o: med * Math.exp(z * s) };
+    if (T === 1 && F.target != null) r.target = F.target;
+    out.rows[T] = r;
+  });
+  return out;
+}
+const annual = (v, p0, T) => v > 0 && p0 > 0 ? Math.pow(v / p0, 1 / T) - 1 : null;
+let projSel = null;
+function renderProjSociete() {
+  const c = compute(), L = societes(c);
+  if (!L.length) { $('#projBody').innerHTML = `<div class="card empty"><h2>Aucune société</h2><p>Les projections portent sur les sociétés de la page 🏢 Sociétés (actions détenues ou « à analyser »).</p><button class="btn primary" data-act="tab" data-tab="societes">Aller aux Sociétés</button></div>`; return; }
+  if (!projSel || !L.some(a => a.id === projSel)) projSel = (L.find(a => a.id === S.settings.projSel) || L[0]).id;
+  const a = assetById(projSel), R = projCalc(a), P = R.P, F = R.F, p0 = F.price, T = +P.h || 3;
+  const pctIn = (k, lab) => `<label>${lab}<input data-proj="${k}" inputmode="decimal" value="${String(+(P[k] * 100).toFixed(2)).replace('.', ',')}"></label>`;
+  const nIn = (k, lab) => `<label>${lab}<input data-proj="${k}" inputmode="decimal" value="${String(P[k]).replace('.', ',')}"></label>`;
+  const cell = (v, T) => v == null ? '<td>–</td>' : `<td style="text-align:right"><b>${money(v, a.ccy)}</b><br><span class="small ${cls(v / p0 - 1)}">${pct(v / p0 - 1)} · ${pct(annual(v, p0, T))}/an</span></td>`;
+  const rows = HZ.map(t => {
+    const r = R.rows[t] || {};
+    return `<tr class="grp"><td colspan="4"><b>Dans ${t} an${t > 1 ? 's' : ''}</b></td></tr>
+      ${r.fond ? `<tr><td>Bénéfices × PER</td>${cell(r.fond.p, t)}${cell(r.fond.c, t)}${cell(r.fond.o, t)}</tr>` : `<tr><td>Bénéfices × PER</td><td colspan="3" class="muted small">BPA inconnu : renseigne-le dans 🏢 Sociétés (ou « 📥 Alpha Vantage »).</td></tr>`}
+      ${r.stat ? `<tr><td>Statistique (volatilité)</td>${cell(r.stat.p, t)}${cell(r.stat.c, t)}${cell(r.stat.o, t)}</tr>` : ''}
+      ${r.target != null ? `<tr><td>Objectif des analystes (12 mois)</td><td></td>${cell(r.target, 1)}<td></td></tr>` : ''}
+      ${r.div ? `<tr><td class="small muted">+ dividendes encaissés (environ)</td><td colspan="3" class="small muted">${money(r.div, a.ccy)} par action sur ${t} an${t > 1 ? 's' : ''}</td></tr>` : ''}`;
+  }).join('');
+  $('#projBody').innerHTML = `
+    <div class="toolbar"><h3 class="grow" style="margin:0">🔮 Projections du cours</h3>
+      <label class="small">Société <select id="projSel">${L.map(x => `<option value="${x.id}" ${x.id === a.id ? 'selected' : ''}>${esc(nm(x))}${c.by[x.id].qty > 0 ? '' : ' (à analyser)'}</option>`).join('')}</select></label>
+      <label class="small">Graphique à <select id="projH">${HZ.map(t => `<option value="${t}" ${t === T ? 'selected' : ''}>${t} an${t > 1 ? 's' : ''}</option>`).join('')}</select></label></div>
+    <p class="disclaimer">⚠️ Ce sont des <b>fourchettes de scénarios</b>, pas des prévisions : personne ne connaît le cours futur. Elles servent à voir ce qu’il faudrait croire (croissance, PER) pour qu’un prix soit atteint. Ce n’est pas un conseil en investissement.</p>
+    ${!(p0 > 0) ? '<div class="banner warn">Pas de cours pour cette société : actualise les cours d’abord.</div>' : `
+    <div class="kpis">${kpi('Cours actuel', money(p0, a.ccy), a.priceDate ? fmtDate(a.priceDate) : '')}${kpi('BPA (12 m)', F.eps != null ? num(F.eps, 2) : '–', F.src.eps)}${kpi('PER actuel', F.pe != null ? num(F.pe, 1) : '–', F.src.pe)}${kpi('Volatilité annuelle', pctAbs(P.vol), 'historique du cours' + (climate().on && Math.abs(climate().k - 1) > 0.02 ? ' · 1re année ×' + num(climate().k, 2) + ' (climat)' : ''))}</div>
+    <div class="card"><div class="chartbox tall"><canvas id="chProj"></canvas></div>
+      <p class="small muted">Trait plein : cours passé. Zone bleue : 80 % des trajectoires possibles selon la volatilité (méthode statistique). Points : scénarios pessimiste, central et optimiste « Bénéfices × PER »${F.target != null ? ' ; losange : objectif des analystes à 12 mois' : ''}.</p></div>
+    <div class="card"><h3>Résultats</h3><div class="tbl-wrap"><table>
+      <thead><tr><th>Méthode</th><th style="text-align:right">Pessimiste</th><th style="text-align:right">Central</th><th style="text-align:right">Optimiste</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+    <div class="card"><h3>Hypothèses <span class="muted small">(modifiables, gardées pour cette société)</span></h3>
+      <div class="form-grid">
+        ${pctIn('gP', 'Croissance du BPA /an — pessimiste (%)')}${pctIn('gC', 'Croissance du BPA /an — centrale (%)')}${pctIn('gO', 'Croissance du BPA /an — optimiste (%)')}
+        ${nIn('peP', 'PER de sortie — pessimiste')}${nIn('peC', 'PER de sortie — central')}${nIn('peO', 'PER de sortie — optimiste')}
+        ${pctIn('mu', 'Rendement annuel moyen supposé (%) — statistique')}${pctIn('vol', 'Volatilité annuelle (%) — statistique')}
+      </div>
+      <div class="toolbar" style="margin:10px 0 0"><button class="btn sm" data-act="projreset" data-id="${a.id}">↺ Valeurs par défaut</button><button class="btn sm" data-act="socopen" data-id="${a.id}">🏢 Voir la fiche société</button><button class="btn sm" data-act="socask" data-id="${a.id}">🤖 Fiche Claude</button></div>
+      <details style="margin-top:10px"><summary class="small">Comment c’est calculé ?</summary>
+        <ul class="small">
+          <li><b>Bénéfices × PER</b> : prix futur = BPA actuel × (1 + croissance)<sup>années</sup> × PER de sortie. Par défaut : croissance tirée des résultats récents (ou 6 %), ± 5 points ; PER actuel (borné entre 8 et 35), −20 % / +20 %.</li>
+          <li><b>Statistique</b> : on suppose que le cours fluctue comme par le passé (volatilité historique) autour d’un rendement moyen (par défaut, la tendance du cours sur la période disponible, bornée entre −5 % et +12 % par an). Pessimiste et optimiste = 10e et 90e centiles : 8 trajectoires sur 10 finissent entre les deux.</li>
+          <li><b>Objectif des analystes</b> : moyenne publiée (Alpha Vantage ou ta saisie), à 12 mois, souvent optimiste.</li>
+          <li>Les dividendes ne sont pas inclus dans les prix ; leur montant approximatif est indiqué à part.</li>
+        </ul></details>
+    </div>`}`;
+  if (p0 > 0) drawProj(a, R, T);
+}
+function drawProj(a, R, T) {
+  const hist = (a.hist || []).slice(-260), labels = [], past = [], band = [], lo = [], hi = [], med = [];
+  const step = Math.max(1, Math.floor(hist.length / 120));
+  hist.forEach((x, i) => { if (i % step === 0 || i === hist.length - 1) { labels.push(x[0]); past.push(x[1]); } });
+  if (!labels.length) { labels.push(today()); past.push(R.F.price); }
+  const n0 = labels.length - 1, p0 = R.F.price, P = R.P, months = T * 12;
+  for (let i = 0; i < n0; i++) { lo.push(null); hi.push(null); med.push(null); }
+  lo.push(p0); hi.push(p0); med.push(p0);
+  const d0 = new Date(labels[n0] + 'T12:00:00');
+  for (let mth = 1; mth <= months; mth++) {
+    const d = new Date(d0); d.setMonth(d.getMonth() + mth); labels.push(d.toISOString().slice(0, 10)); past.push(null);
+    const t = mth / 12, cv = climVar(P.vol, t), m = p0 * Math.exp(P.mu * t - cv / 2), s = Math.sqrt(cv);
+    lo.push(m * Math.exp(-1.2816 * s)); hi.push(m * Math.exp(1.2816 * s)); med.push(m);
+  }
+  const pts = k => labels.map((l, i) => { const yrs = (i - n0) / 12; const hit = HZ.find(h => h <= T && Math.abs(yrs - h) < 1e-9); return hit && R.rows[hit].fond ? R.rows[hit].fond[k] : null; });
+  const tgt = labels.map((l, i) => (i - n0 === 12 && R.rows[1] && R.rows[1].target != null) ? R.rows[1].target : null);
+  mkChart('chProj', {
+    type: 'line', data: { labels, datasets: [
+      { label: 'Cours passé', data: past, borderColor: '#1d4e89', borderWidth: 2, pointRadius: 0, spanGaps: false },
+      { label: 'Haut de fourchette (90 %)', data: hi, borderColor: 'rgba(47,91,234,.35)', backgroundColor: 'rgba(47,91,234,.12)', pointRadius: 0, borderWidth: 1, fill: '+1' },
+      { label: 'Bas de fourchette (10 %)', data: lo, borderColor: 'rgba(47,91,234,.35)', pointRadius: 0, borderWidth: 1, fill: false },
+      { label: 'Médiane statistique', data: med, borderColor: '#2f5bea', borderDash: [5, 4], pointRadius: 0, borderWidth: 1.5 },
+      { label: 'Pessimiste (Bénéf. × PER)', data: pts('p'), borderColor: '#c62828', backgroundColor: '#c62828', showLine: false, pointRadius: 6 },
+      { label: 'Central (Bénéf. × PER)', data: pts('c'), borderColor: '#555', backgroundColor: '#555', showLine: false, pointRadius: 6 },
+      { label: 'Optimiste (Bénéf. × PER)', data: pts('o'), borderColor: '#2e7d32', backgroundColor: '#2e7d32', showLine: false, pointRadius: 6 },
+      { label: 'Objectif analystes', data: tgt, borderColor: '#b26b00', backgroundColor: '#f2c14e', showLine: false, pointRadius: 8, pointStyle: 'rectRot' }
+    ] },
+    options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, spanGaps: true,
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, filter: it => !/fourchette/.test(it.text) } }, tooltip: { callbacks: { label: x => x.raw == null ? null : `${x.dataset.label} : ${num(x.raw, 2)} ${a.ccy}` } } },
+      scales: { x: { ticks: { maxTicksLimit: 10 } }, y: { ticks: { callback: v => num(v, 0) } } } }
+  });
+}
+
+/* ---------- Onglets, boutons et saisies ---------- */
+(function installSocietes() {
+  const tabs = document.getElementById('tabs'), ref = tabs && tabs.querySelector('[data-tab="analyse"]');
+  if (ref && !tabs.querySelector('[data-tab="societes"]')) {
+    ref.insertAdjacentHTML('afterend', '<button data-act="tab" data-tab="societes">🏢 Sociétés</button><button data-act="tab" data-tab="projections">🔮 Projections</button>');
+    const v = document.getElementById('v-analyse');
+    v.insertAdjacentHTML('afterend', '<section id="v-societes" class="view"></section><section id="v-projections" class="view"></section>');
+  }
+})();
+async function socAction(act, id) {
+  const a = id ? assetById(id) : null;
+  switch (act) {
+    case 'socopen': socOpen = id; showTab('societes'); return true;
+    case 'socproj': projSel = id; S.settings.projSel = id; S.settings.projMode = 'societe'; persist(); showTab('projections'); return true;
+    case 'socov': if (a) { toast('Chargement Alpha Vantage…'); await fetchOverview(a, true); renderAll(); } return true;
+    case 'socovall': {
+      const L = societes().filter(x => x.symbol && !(x.ov && x.ov.at && Date.now() - new Date(x.ov.at).getTime() < 7 * 864e5));
+      if (!S.settings.avKey) { toast('Ajoute ta clé Alpha Vantage gratuite dans ⚙️ Paramètres.', 'err'); return true; }
+      if (!L.length) { toast('Toutes les fiches ont moins de 7 jours.'); return true; }
+      toast(`Chargement de ${L.length} fiche(s) (1 requête chacune ; 25 gratuites par jour)…`);
+      for (const x of L.slice(0, 10)) { await fetchOverview(x, false); await new Promise(r => setTimeout(r, 1500)); }
+      renderAll(); toast('Fondamentaux mis à jour.'); return true;
+    }
+    case 'socask': openCompanyAsk(id); return true;
+    case 'socadd': openAsset(null, { watch: false, analyse: true, type: 'action' }); return true;
+    case 'socrm': if (a) { a.analyse = false; save(); renderAll(); toast(nm(a) + ' retirée de « À analyser ».'); } return true;
+    case 'projreset': if (a) { delete a.proj; save(); renderAll(); } return true;
+    case 'closemodal2': closeModal(); return true;
+  }
+  return false;
+}
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  if (/^(soc(open|proj|ov|ovall|ask|add|rm)|projreset|closemodal2)$/.test(b.dataset.act)) { e.stopImmediatePropagation(); e.preventDefault(); await socAction(b.dataset.act, b.dataset.id); }
+}, true);
+const socNum = s => { const t = String(s || '').replace(/\s/g, '').replace(',', '.'); return t === '' ? null : (isFinite(+t) ? +t : NaN); };
+document.addEventListener('change', e => {
+  const t = e.target;
+  if (t.dataset && t.dataset.fm) {
+    const a = assetById(t.dataset.id); if (!a) return;
+    let v = socNum(t.value); if (Number.isNaN(v)) return toast('Nombre invalide.', 'err');
+    if (v != null && (t.dataset.fm === 'dy' || t.dataset.fm === 'g')) v = v / 100;
+    a.fm = Object.assign({}, a.fm); if (v == null) delete a.fm[t.dataset.fm]; else a.fm[t.dataset.fm] = v;
+    socOpen = a.id; save(); renderAll();
+  } else if (t.dataset && t.dataset.fmnote) {
+    const a = assetById(t.dataset.fmnote); if (a) { a.note = t.value; save(); }
+  } else if (t.id === 'projSel') { projSel = t.value; S.settings.projSel = t.value; persist(); renderAll(); }
+  else if (t.id === 'projH') { const a = assetById(projSel); if (a) { a.proj = Object.assign({}, a.proj, { h: +t.value }); save(); renderAll(); } }
+  else if (t.dataset && t.dataset.proj) {
+    const a = assetById(projSel); if (!a) return;
+    let v = socNum(t.value); if (v == null || Number.isNaN(v)) return toast('Nombre invalide.', 'err');
+    if (!/^pe/.test(t.dataset.proj)) v = v / 100;
+    a.proj = Object.assign({}, a.proj, { [t.dataset.proj]: v }); save(); renderAll();
+  }
+}, true);
+
+
+/* ============================================================================
+   PROJECTIONS V1.6 — « mon petit Aladdin »
+   💼 Portefeuille entier (Monte-Carlo) · ⚡ Risque & scénarios (facteurs, stress tests)
+   🧺 Transparence des ETF · 📰 Veille Tonio (fichier Tonio_retour/bourse_veille_*.json)
+   ============================================================================ */
+const FK = ['m', 'r', 'eu', 'usd', 'oil', 'vg'];
+const FLAB = { m: 'Marché actions', r: 'Taux US 10 ans', eu: 'Taux zone euro 10 ans', usd: 'Euro / dollar', oil: 'Pétrole (Brent)', vg: 'Valeur / croissance' };
+const FKIND = { m: 'log', r: 'diff', eu: 'diff', usd: 'log', oil: 'log', vg: 'diff' };
+const FDEF = { m: 0.16, r: 0.9, eu: 0.8, usd: 0.08, oil: 0.35, vg: 0.08 };    // volatilités annuelles par défaut (taux : en points)
+const MU_DEF = { actions: 0.06, obligations: 0.025, or: 0.03, crypto: 0.05, monetaire: 0.02, autre: 0.03 };
+const SHOCKS = [
+  ['Crise financière 2008-09', { m: -45, r: -1, eu: -1.2, usd: -11, oil: -55, vg: -5 }],
+  ['Covid (fév.–mars 2020)', { m: -34, r: -0.8, eu: -0.4, usd: -1, oil: -55, vg: -10 }],
+  ['Inflation et hausse des taux 2022', { m: -18, r: 2.4, eu: 2.5, usd: -6, oil: 10, vg: 25 }],
+  ['Krach de 20 %', { m: -20, r: -0.5, eu: -0.4, usd: 0, oil: -20, vg: 0 }],
+  ['Taux +1 point (US et zone euro)', { m: 0, r: 1, eu: 1, usd: 0, oil: 0, vg: 0 }],
+  ['Euro +10 % face au dollar', { m: 0, r: 0, eu: 0, usd: 10, oil: 0, vg: 0 }],
+  ['Pétrole +50 %', { m: 0, r: 0, eu: 0, usd: 0, oil: 50, vg: 0 }],
+  ['Rotation vers la « valeur » (+10 %)', { m: 0, r: 0, eu: 0, usd: 0, oil: 0, vg: 10 }]
+];
+const SH0 = { m: 0, r: 0, eu: 0, usd: 0, oil: 0, vg: 0 };
+function mcSet() { S.settings.mc = Object.assign({ mu: { ...MU_DEF }, monthly: 0, shock: { ...SH0, m: -20 } }, S.settings.mc || {}); S.settings.mc.mu = Object.assign({ ...MU_DEF }, S.settings.mc.mu); S.settings.mc.shock = Object.assign({ ...SH0 }, S.settings.mc.shock); return S.settings.mc; }
+
+/* ---------- Données des facteurs ---------- */
+function facStore() { if (!S.factors) S.factors = { mkt: '', s: {}, w: {}, at: null }; if (!S.factors.w) S.factors.w = {}; return S.factors; }
+function defaultMkt() {
+  const c = compute(), etf = c.open.map(p => p.asset).filter(a => a.type === 'etf' || a.type === 'fonds');
+  const w = etf.find(a => /world|monde|acwi|msci|s&p|sp ?500/i.test(nm(a))) || etf[0];
+  return w ? 'asset:' + w.id : 'sym:SPY';
+}
+function mktKey() { const F = facStore(); return F.mkt || defaultMkt(); }
+function weekKey(d) { const t = new Date(d + 'T12:00:00'); t.setDate(t.getDate() - (t.getDay() + 6) % 7); return t.toISOString().slice(0, 10); }
+function toWeekly(rows) { const m = new Map(); [...rows].sort((a, b) => a[0] < b[0] ? -1 : 1).forEach(r => { if (r[1] != null && isFinite(r[1])) m.set(weekKey(r[0]), r[1]); }); return [...m.entries()]; }
+function weeklyOf(a) {
+  const w = toWeekly((a.weekly || []).map(x => [x[0], x[1]])), h = toWeekly((a.hist || []).map(x => [x[0], x[1]]));
+  if (!w.length) return h;
+  const last = w[w.length - 1], hm = new Map(h), ov = hm.get(last[0]);
+  if (ov && Math.abs(ov / last[1] - 1) > 0.15) return w;            // sources incohérentes (devise, ajustement) : on garde l'hebdomadaire seul
+  return w.slice(0, -1).concat(h.filter(x => x[0] >= last[0]));
+}
+/** Séries des facteurs : freq 'd' (quotidien, ~400 j.) ou 'w' (hebdomadaire, jusqu'à 5 ans). */
+function factorSeries(freq) {
+  const F = facStore(), out = {}, k = mktKey(), D = F.s || {}, W = F.w || {};
+  if (k.startsWith('asset:')) { const a = assetById(k.slice(6)); if (a) { const s = freq === 'w' ? weeklyOf(a) : (a.hist || []).map(x => [x[0], x[1]]); if (s.length > 20) out.m = s; } }
+  else if (D.msym === k) { const s = freq === 'w' ? toWeekly([...(W.m || []), ...(D.m || [])]) : D.m; if (s && s.length > 20) out.m = s; }
+  ['r', 'eu', 'usd', 'oil'].forEach(f => { if (D[f] && D[f].length > 20) out[f] = freq === 'w' ? toWeekly(D[f]) : D[f].slice(-400); });
+  if (freq === 'w' && W.vg && W.vg.length > 20) out.vg = W.vg;
+  return out;
+}
+function parseCsvSeries(txt) {
+  const lines = String(txt).trim().split(/\r?\n/), split = l => { const o = []; let cur = '', q = false; for (const ch of l) { if (ch === '"') q = !q; else if (ch === ',' && !q) { o.push(cur); cur = ''; } else cur += ch; } o.push(cur); return o; };
+  const h = split(lines[0]), iT = h.indexOf('TIME_PERIOD'), iV = h.indexOf('OBS_VALUE');
+  if (iT < 0 || iV < 0) throw new Error('format BCE inattendu');
+  return lines.slice(1).map(split).map(r => [r[iT], parseFloat(r[iV])]).filter(r => /^\d{4}-\d{2}-\d{2}$/.test(r[0]) && isFinite(r[1]));
+}
+async function ecbSeries(path, start) {
+  const u = `https://data-api.ecb.europa.eu/service/data/${path}?format=csvdata&detail=dataonly&startPeriod=${start}`;
+  try { const r = await fetch(u); if (!r.ok) throw new Error('HTTP ' + r.status); return parseCsvSeries(await r.text()); }
+  catch (e) {
+    if (!S.settings.gsUrl) throw new Error('site de la BCE inaccessible depuis le navigateur (ajoute la feuille Google, relais V5)');
+    const j = await gsCall({ action: 'ecb', s: path, start });
+    if (!j.csv) throw new Error('mets à jour le relais Google en V5 (⚙️ Paramètres)');
+    return parseCsvSeries(j.csv);
+  }
+}
+async function loadFactors() {
+  const F = facStore(), errs = [], k = mktKey(), start = addDays(today(), -5 * 366 - 14);
+  const keep = arr => arr.filter(x => x[0] && isFinite(x[1])).sort((a, b) => a[0] < b[0] ? -1 : 1).filter(x => x[0] >= start);
+  const avw = async sym => Object.entries((await av('TIME_SERIES_WEEKLY', { symbol: sym }))['Weekly Time Series'] || {}).map(([d, v]) => [d, +v['4. close']]);
+  const jobs = [
+    ['eu', 'BCE', () => ecbSeries('YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y', start)],
+    ['usd', 'BCE', () => ecbSeries('EXR/D.USD.EUR.SP00.A', start)]
+  ];
+  if (S.settings.avKey) {
+    jobs.push(['r', 'AV', async () => (await av('TREASURY_YIELD', { interval: 'daily', maturity: '10year' })).data.filter(x => x.value !== '.').map(x => [x.date, +x.value])]);
+    jobs.push(['oil', 'AV', async () => (await av('BRENT', { interval: 'daily' })).data.filter(x => x.value !== '.').map(x => [x.date, +x.value])]);
+    jobs.push(['vg', 'AV', async () => { const v = toWeekly(await avw('IVE')); await sleep(1500); const g = new Map(toWeekly(await avw('IVW'))); return v.filter(x => g.has(x[0]) && x[1] > 0 && g.get(x[0]) > 0).map(x => [x[0], Math.log(x[1] / g.get(x[0]))]); }]);
+    if (k.startsWith('sym:')) jobs.push(['m', 'AV', async () => { const d = Object.entries((await av('TIME_SERIES_DAILY', { symbol: k.slice(4), outputsize: 'compact' }))['Time Series (Daily)'] || {}).map(([x, v]) => [x, +v['4. close']]); await sleep(1500); F.w.m = keep(await avw(k.slice(4))); return d; }]);
+  } else errs.push('taux US, pétrole et valeur/croissance : ajoute une clé Alpha Vantage gratuite (⚙️ Paramètres)');
+  for (let i = 0; i < jobs.length; i++) {
+    const [f, src, fn] = jobs[i];
+    setStatus(`Facteur ${i + 1}/${jobs.length} : ${FLAB[f]}…`);
+    try {
+      const s = keep(await fn());
+      if (s.length > 20) { if (f === 'vg') F.w.vg = s; else F.s[f] = s; if (f === 'm') F.s.msym = k; } else errs.push(FLAB[f] + ' : réponse vide');
+    } catch (e) { errs.push(FLAB[f] + ' : ' + explainErr(e)); if ((e.message || '').startsWith('LIMIT:')) break; }
+    if (src === 'AV' && i < jobs.length - 1) await sleep(1500);
+  }
+  setStatus(''); F.at = new Date().toISOString(); riskCache = null; save(); renderAll();
+  toast(errs.length ? 'Facteurs chargés en partie : ' + errs.join(' · ') : '✅ Facteurs chargés (5 ans d’historique).', errs.length ? 'err' : '');
+}
+async function loadWeeklyLines() {
+  const c = compute(), ref = mktKey(), L = c.open.map(p => p.asset).filter(a => a.symbol && a.source !== 'manuel' && !(a.weeklyAt && Date.now() - a.weeklyAt < 30 * 864e5)).sort((x, y) => (ref === 'asset:' + y.id) - (ref === 'asset:' + x.id) || compute().by[y.id].value - compute().by[x.id].value);
+  if (!L.length) return toast('Toutes tes lignes ont déjà leur historique de 5 ans (moins de 30 jours).');
+  const todo = L.slice(0, 10); let ok = 0; const errs = [];
+  for (let i = 0; i < todo.length; i++) {
+    const a = todo[i]; setStatus(`Historique 5 ans ${i + 1}/${todo.length} : ${a.symbol}…`);
+    try { a.weekly = await fetchWeekly(a); a.weeklyAt = Date.now(); ok++; }
+    catch (e) { if ((e.message || '').startsWith('LIMIT:')) { errs.push('limite gratuite atteinte : relance demain'); break; } errs.push(a.symbol + ' : ' + explainErr(e)); }
+    if (i < todo.length - 1) await sleep(S.settings.provider === 'twelvedata' ? 8000 : 1500);
+  }
+  setStatus(''); riskCache = null; save(); renderAll();
+  toast(`✅ ${ok}/${todo.length} historiques chargés` + (L.length > todo.length ? ` (${L.length - todo.length} restants : reclique plus tard)` : '') + (errs.length ? ' · ' + errs.join(' · ') : '.'), errs.length ? 'err' : '');
+}
+
+/* ---------- Petits outils numériques ---------- */
+function chgMap(series, kind) {            // kind 'log' (rendement) ou 'diff' (variation en points)
+  const m = new Map();
+  for (let i = 1; i < series.length; i++) { const a = series[i - 1][1], b = series[i][1]; if (!(a > 0 && b > 0) && kind === 'log') continue; m.set(series[i][0], kind === 'log' ? Math.log(b / a) : b - a); }
+  return m;
+}
+function solve(A, b) {                       // élimination de Gauss avec pivot partiel
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-14) return null; [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) if (r !== c) { const f = M[r][c] / M[c][c]; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+  }
+  return M.map((r, i) => r[n] / r[i]);
+}
+function chol(S0) {
+  const n = S0.length;
+  for (let jit = 0; jit < 6; jit++) {
+    const A = S0.map((r, i) => r.map((v, j) => v + (i === j ? jit * 1e-6 * (1 + Math.abs(S0[i][i])) : 0))), L = A.map(() => Array(n).fill(0)); let ok = true;
+    for (let i = 0; i < n && ok; i++) for (let j = 0; j <= i; j++) {
+      let s = A[i][j]; for (let k = 0; k < j; k++) s -= L[i][k] * L[j][k];
+      if (i === j) { if (s <= 0) { ok = false; break; } L[i][i] = Math.sqrt(s); } else L[i][j] = s / L[j][j];
+    }
+    if (ok) return L;
+  }
+  return S0.map((r, i) => r.map((v, j) => i === j ? Math.sqrt(Math.max(v, 0)) : 0));
+}
+function rngS(seed) { let t = seed >>> 0; return () => { t += 0x6D2B79F5; let r = Math.imul(t ^ (t >>> 15), 1 | t); r ^= r + Math.imul(r ^ (r >>> 7), 61 | r); return ((r ^ (r >>> 14)) >>> 0) / 4294967296; }; }
+function gauss(R) { let u = 0; while (!u) u = R(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * R()); }
+const qtl = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))))];
+
+/* ---------- Modèle de risque (Aladdin simplifié) ---------- */
+function defBeta(a) {
+  const cl = assetClass(a), usSh = a.ccy === 'USD' ? 1 : (parseSplit(a.regionSplit) || []).filter(([k]) => /états|etats|usa|u\.s|united states|amérique du nord/i.test(k)).reduce((t, x) => t + x[1], 0);
+  const z = { ...SH0 };
+  const b = { actions: { ...z, m: 1, usd: a.type === 'action' ? -0.3 * usSh : 0 }, obligations: a.ccy === 'USD' ? { ...z, m: 0.05, r: -0.06, usd: -1 } : { ...z, m: 0.05, eu: -0.06 }, or: { ...z, m: 0.1, r: -0.03, usd: -0.8, oil: 0.1 }, crypto: { ...z, m: 1.5, usd: -0.5 } }[cl] || { ...z, m: 0.5 };
+  const res = cl === 'actions' ? (a.type === 'action' ? 0.2 : 0.05) : { obligations: 0.03, or: 0.12, crypto: 0.55 }[cl] || 0.1;
+  return { b, res, src: 'défaut', q: 'défaut' };
+}
+function regress(ar, fch, avail, lo, hi) {
+  const dates = [...ar.keys()].filter(d => avail.every(f => fch[f].has(d))).slice(-hi);
+  if (dates.length < lo) return null;
+  const k = avail.length + 1, XtX = Array.from({ length: k }, () => Array(k).fill(0)), Xty = Array(k).fill(0);
+  const rows = dates.map(d => [1, ...avail.map(f => fch[f].get(d))]), y = dates.map(d => ar.get(d));
+  rows.forEach((x, n) => { for (let i = 0; i < k; i++) { Xty[i] += x[i] * y[n]; for (let j = 0; j < k; j++) XtX[i][j] += x[i] * x[j]; } });
+  for (let i = 1; i < k; i++) XtX[i][i] *= 1.0001;
+  const bet = solve(XtX, Xty); if (!bet) return null;
+  const ym = y.reduce((t, v) => t + v, 0) / y.length; let sse = 0, sst = 0;
+  rows.forEach((x, n) => { const f = x.reduce((t, v, i) => t + v * bet[i], 0); sse += (y[n] - f) ** 2; sst += (y[n] - ym) ** 2; });
+  const s2 = sse / Math.max(1, dates.length - k), im = avail.indexOf('m');
+  let se = null; if (im >= 0) { const e = Array(k).fill(0); e[im + 1] = 1; const col = solve(XtX, e); if (col) se = Math.sqrt(Math.max(0, s2 * col[im + 1])); }
+  const b = {}; avail.forEach((f, i) => b[f] = bet[i + 1]);
+  return { b, s2, n: dates.length, r2: sst ? 1 - sse / sst : null, se };
+}
+function factorCov(fch, avail, minN, ann) {
+  const Sf = FK.map((f, i) => FK.map((g, j) => i === j ? FDEF[f] ** 2 : 0));
+  if (!avail.length) return { Sf, n: 0 };
+  const dates = [...fch[avail[0]].keys()].filter(d => avail.every(f => fch[f].has(d))).slice(-260);
+  if (dates.length < minN) return { Sf, n: dates.length };
+  const mean = {}; avail.forEach(f => mean[f] = dates.reduce((t, d) => t + fch[f].get(d), 0) / dates.length);
+  avail.forEach(f => avail.forEach(g => { const i = FK.indexOf(f), j = FK.indexOf(g); Sf[i][j] = ann * dates.reduce((t, d) => t + (fch[f].get(d) - mean[f]) * (fch[g].get(d) - mean[g]), 0) / (dates.length - 1); }));
+  return { Sf, n: dates.length };
+}
+let riskCache = null;
+function riskModel() {
+  const key = JSON.stringify([S.factors && S.factors.at, mktKey(), S.assets.map(a => [a.id, a.priceDate, (a.hist || []).length, (a.weekly || []).length]), S.tx.length]);
+  if (riskCache && riskCache.key === key) return riskCache;
+  const FD = factorSeries('d'), FW = factorSeries('w'), aD = FK.filter(f => FD[f]);
+  let aW = FK.filter(f => FW[f] && FW[f].length >= 105); if (!aW.includes('m')) aW = [];   // pas de version hebdomadaire sans le marché
+  const chD = {}, chW = {}; aD.forEach(f => chD[f] = chgMap(FD[f], FKIND[f])); aW.forEach(f => chW[f] = chgMap(FW[f], FKIND[f]));
+  // covariance des facteurs : hebdomadaire si possible (plus long, plus stable), sinon quotidienne
+  let cov = factorCov(chW, aW, 104, 52), covSrc = 'hebdomadaire';
+  if (cov.n < 104) { cov = factorCov(chD, aD, 40, 252); covSrc = cov.n >= 40 ? 'quotidienne' : 'par défaut'; }
+  const Sf = cov.Sf, mkt = mktKey(), c = compute(), lines = [];
+  c.open.forEach(p => {
+    const a = p.asset, def = defBeta(a); let est = def;
+    if (mkt === 'asset:' + a.id) est = { b: { ...SH0, m: 1 }, res: 0, src: 'référence marché', q: 'référence' };
+    else {
+      let fit = null, freq = '';
+      const conv = (rows, usdCh) => { const m = new Map(); for (let i = 1; i < rows.length; i++) { if (!(rows[i - 1][1] > 0 && rows[i][1] > 0)) continue; let r = Math.log(rows[i][1] / rows[i - 1][1]); if (a.ccy === 'USD' && usdCh && usdCh.has(rows[i][0])) r -= usdCh.get(rows[i][0]); m.set(rows[i][0], r); } return m; };
+      const wk = weeklyOf(a);
+      if (wk.length > 104 && aW.length) { fit = regress(conv(wk, chW.usd), chW, aW, 104, 260); freq = 'w'; }
+      if (!fit && (a.hist || []).length > 45 && aD.length) { fit = regress(conv(a.hist.map(x => [x[0], x[1]]), chD.usd), chD, aD, 40, 260); freq = 'd'; }
+      if (fit) {
+        const big = freq === 'w' ? fit.n >= 156 : fit.n >= 200, se = fit.se ?? 1;
+        let q = big && se <= 0.15 ? 'fiable' : se <= 0.3 ? 'moyenne' : 'peu fiable';
+        if (assetClass(a) === 'actions' && fit.r2 != null && fit.r2 < 0.05) q = 'peu fiable';
+        const w = { fiable: 1, moyenne: 0.7, 'peu fiable': 0.3 }[q], b = {};
+        FK.forEach(f => b[f] = fit.b[f] != null ? w * fit.b[f] + (1 - w) * def.b[f] : def.b[f]);
+        const res = Math.sqrt(fit.s2 * (freq === 'w' ? 52 : 252));
+        est = { b, res: q === 'peu fiable' ? Math.max(res, def.res) : res, src: freq === 'w' ? `hebdo ${fit.n} sem.` : `quotidien ${fit.n} j.`, r2: fit.r2, se: fit.se, q };
+      }
+    }
+    const bv = FK.map(f => est.b[f]);
+    const fv = bv.reduce((t, bi, i) => t + bv.reduce((s, bj, j) => s + bi * bj * Sf[i][j], 0), 0);
+    lines.push({ a, p, ...est, vol: Math.sqrt(fv + est.res ** 2) });
+  });
+  const cash = c.hasCash && c.cash > 0 ? c.cash : 0, tot = lines.reduce((t, l) => t + l.p.value, 0) + cash;
+  lines.forEach(l => l.w = tot ? l.p.value / tot : 0);
+  const n = lines.length, Cov = Array.from({ length: n }, () => Array(n).fill(0));
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    let s = 0; FK.forEach((f, x) => FK.forEach((g, y) => s += lines[i].b[f] * lines[j].b[g] * Sf[x][y]));
+    Cov[i][j] = s + (i === j ? lines[i].res ** 2 : 0);
+  }
+  const Cw = Cov.map(r => r.reduce((t, v, j) => t + v * lines[j].w, 0)), pv = lines.reduce((t, l, i) => t + l.w * Cw[i], 0);
+  lines.forEach((l, i) => l.rc = pv > 0 ? l.w * Cw[i] / pv : 0);
+  const port = { vol: Math.sqrt(Math.max(pv, 0)), b: {} };
+  FK.forEach(f => port.b[f] = lines.reduce((t, l) => t + l.w * l.b[f], 0));
+  const mc = mcSet(); port.mu = lines.reduce((t, l) => t + l.w * muOf(l.a, mc), 0) + (tot ? cash / tot * mc.mu.monetaire : 0);
+  riskCache = { key, lines, Sf, port, tot, cash, FD, FW, covSrc, covN: cov.n };
+  return riskCache;
+}
+function muOf(a, mc) { return a.proj && a.proj.mu != null && a.type === 'action' ? a.proj.mu : mc.mu[assetClass(a)] ?? mc.mu.autre; }
+
+/* ---------- Monte-Carlo du portefeuille ---------- */
+let mcCache = null;
+function monteCarlo() {
+  const R = riskModel(), mc = mcSet(), CK = climate().k, key = R.key + JSON.stringify(mc) + CK;
+  if (mcCache && mcCache.key === key) return mcCache;
+  const P = 2000, M = 60, L = chol(R.Sf), rnd = rngS(20261125), n = R.lines.length;
+  const v0 = R.lines.map(l => l.p.value), w0 = R.lines.map(l => l.w), mu = R.lines.map(l => muOf(l.a, mc));
+  const drift = R.lines.map((l, i) => (mu[i] - l.vol * l.vol / 2) / 12), sq = 1 / Math.sqrt(12), cashR = mc.mu.monetaire / 12;
+  const tot0 = R.tot || 1, monthly = +mc.monthly || 0;
+  const out = Array.from({ length: M + 1 }, () => new Float64Array(P)), dd = new Float64Array(P);
+  for (let p = 0; p < P; p++) {
+    const v = v0.slice(); let cash = R.cash, peak = R.tot;
+    out[0][p] = R.tot;
+    for (let m = 1; m <= M; m++) {
+      const kk = m <= 12 ? CK : 1, z = FK.map(() => gauss(rnd)), f = L.map(row => row.reduce((t, x, k) => t + x * z[k], 0) * sq * kk);
+      let tot = 0;
+      for (let i = 0; i < n; i++) {
+        const l = R.lines[i]; let r = drift[i] - (kk * kk - 1) * l.vol * l.vol / 24 + l.res * sq * kk * gauss(rnd);
+        FK.forEach((k, x) => r += l.b[k] * f[x]);
+        v[i] = v[i] * Math.exp(r) + monthly * w0[i];
+        tot += v[i];
+      }
+      cash = cash * (1 + cashR) + (R.cash ? monthly * R.cash / tot0 : 0);
+      tot += cash; out[m][p] = tot;
+      if (tot > peak) peak = tot; else dd[p] = Math.max(dd[p], 1 - tot / peak);
+    }
+  }
+  const pct = out.map(arr => { const s = Float64Array.from(arr).sort(); return { p5: qtl(s, .05), p10: qtl(s, .1), p25: qtl(s, .25), p50: qtl(s, .5), p75: qtl(s, .75), p90: qtl(s, .9), mean: s.reduce((t, x) => t + x, 0) / s.length }; });
+  const at = m => { const inv = R.tot + monthly * m, arr = out[m]; let lose = 0, l20 = 0; for (const x of arr) { if (x < inv) lose++; if (x < inv * 0.8) l20++; } return { ...pct[m], inv, pLose: lose / P, pL20: l20 / P }; };
+  const ddS = Float64Array.from(dd).sort();
+  mcCache = { key, pct, at, M, ddMed: qtl(ddS, .5), dd90: qtl(ddS, .9), R };
+  return mcCache;
+}
+
+/* ---------- Rendus ---------- */
+const PMODES = [['societe', '🏢 Par société'], ['portefeuille', '💼 Portefeuille entier'], ['risque', '⚡ Risque & scénarios'], ['etf', '🧺 Transparence ETF'], ['veille', '📰 Veille Tonio'], ['macro', '🌍 Macro & climat']];
+function renderProjections() {
+  const mode = S.settings.projMode || 'societe';
+  $('#v-projections').innerHTML = `<div class="seg" style="margin-bottom:12px;flex-wrap:wrap">${PMODES.map(([k, l]) => `<button class="${k === mode ? 'on' : ''}" data-act="projmode" data-mode="${k}">${l}</button>`).join('')}</div><div id="projBody"></div>`;
+  ({ societe: renderProjSociete, portefeuille: renderProjPortef, risque: renderProjRisque, etf: renderProjEtf, veille: renderProjVeille, macro: renderProjMacro })[mode]();
+}
+const DISC = '<p class="disclaimer">⚠️ Fourchettes et scénarios calculés à partir du passé et d’hypothèses que tu peux modifier : ce ne sont pas des prévisions. Ce n’est pas un conseil en investissement.</p>';
+function noPos() { return `<div class="card empty"><h2>Aucune position</h2><p>Cette vue porte sur les lignes que tu détiens.</p></div>`; }
+
+function renderProjPortef() {
+  const c = compute(); if (!c.open.length) return $('#projBody').innerHTML = noPos();
+  const mc = mcSet(), S0 = monteCarlo(), R = S0.R;
+  const row = (m) => { const x = S0.at(m); return `<tr><td><b>Dans ${m / 12} an${m > 12 ? 's' : ''}</b><br><span class="small muted">versé : ${eur(x.inv)}</span></td>
+    <td style="text-align:right">${eur(x.p10)}<br><span class="small ${cls(x.p10 / x.inv - 1)}">${pct(x.p10 / x.inv - 1)}</span></td>
+    <td style="text-align:right"><b>${eur(x.p50)}</b><br><span class="small ${cls(x.p50 / x.inv - 1)}">${pct(x.p50 / x.inv - 1)}</span></td>
+    <td style="text-align:right">${eur(x.p90)}<br><span class="small ${cls(x.p90 / x.inv - 1)}">${pct(x.p90 / x.inv - 1)}</span></td>
+    <td style="text-align:right">${pctAbs(x.pLose)}</td><td style="text-align:right">${pctAbs(x.pL20)}</td></tr>`; };
+  const muIn = k => `<label>${CLASSES[k] || k} (%/an)<input data-mcmu="${k}" inputmode="decimal" value="${String(+(mc.mu[k] * 100).toFixed(2)).replace('.', ',')}"></label>`;
+  const classes = [...new Set(c.open.map(p => assetClass(p.asset)))].concat(c.hasCash ? ['monetaire'] : []);
+  $('#projBody').innerHTML = `${DISC}
+    <div class="kpis">${kpi('Valeur actuelle', eur(R.tot), c.hasCash ? 'liquidités comprises' : '')}${kpi('Rendement moyen supposé', pct(R.port.mu), 'par an, selon tes hypothèses')}${kpi('Volatilité estimée', pctAbs(R.port.vol), 'par an')}${kpi('Baisse maximale « typique »', '−' + pctAbs(S0.ddMed), 'sur 5 ans ; 1 fois sur 10 : −' + pctAbs(S0.dd90))}</div>
+    <div class="card"><h3>Valeur future du portefeuille (2 000 simulations)</h3><div class="chartbox tall"><canvas id="chMC"></canvas></div>
+      <p class="small muted">Zone claire : 8 simulations sur 10 finissent dedans (10e–90e centile). Zone foncée : la moitié (25e–75e). Trait : la médiane. Pointillés : ce que tu as versé. Les lignes bougent ensemble selon leurs liens réels (marché, taux, dollar, pétrole) : c’est ce qui distingue ce calcul d’une simple addition.</p></div>
+    <div class="card"><div class="tbl-wrap"><table><thead><tr><th>Horizon</th><th style="text-align:right">Pessimiste (1 sur 10)</th><th style="text-align:right">Médiane</th><th style="text-align:right">Optimiste (1 sur 10)</th><th style="text-align:right">Risque de perte</th><th style="text-align:right">Risque de perdre > 20 %</th></tr></thead>
+      <tbody>${[12, 36, 60].map(row).join('')}</tbody></table></div></div>
+    <div class="card"><h3>Hypothèses</h3><div class="form-grid">
+      <label>Versement mensuel (€)<input data-mcmonthly inputmode="decimal" value="${mc.monthly || ''}" placeholder="0"></label>
+      ${classes.map(muIn).join('')}</div>
+      <p class="small muted">Rendements annuels moyens supposés par classe d’actifs (par défaut : actions 6 %, obligations 2,5 %, or 3 %, liquidités 2 %). Pour une action, le rendement choisi dans « 🏢 Par société » est utilisé s’il a été modifié. Volatilités et liens entre lignes : voir « ⚡ Risque & scénarios ».</p>
+      <div class="toolbar" style="margin:8px 0 0"><button class="btn sm" data-act="mcreset">↺ Valeurs par défaut</button></div></div>`;
+  const labels = [], b = k => S0.pct.map(x => x[k]);
+  for (let m = 0; m <= S0.M; m++) { const d = new Date(); d.setMonth(d.getMonth() + m); labels.push(d.toISOString().slice(0, 7)); }
+  mkChart('chMC', { type: 'line', data: { labels, datasets: [
+    { label: '90e', data: b('p90'), borderWidth: 0, pointRadius: 0, backgroundColor: 'rgba(47,91,234,.12)', fill: '+3' },
+    { label: '75e', data: b('p75'), borderWidth: 0, pointRadius: 0, backgroundColor: 'rgba(47,91,234,.22)', fill: '+1' },
+    { label: 'Médiane', data: b('p50'), borderColor: '#1d4e89', borderWidth: 2, pointRadius: 0 },
+    { label: '25e', data: b('p25'), borderWidth: 0, pointRadius: 0 },
+    { label: '10e', data: b('p10'), borderWidth: 0, pointRadius: 0 },
+    { label: 'Versé', data: S0.pct.map((x, m) => R.tot + (+mc.monthly || 0) * m), borderColor: '#888', borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0 }
+  ] }, options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { labels: { filter: it => /Médiane|Versé/.test(it.text) } }, tooltip: { callbacks: { label: x => `${x.dataset.label} : ${eur(x.raw)}` } } },
+    scales: { x: { ticks: { maxTicksLimit: 11 } }, y: { ticks: { callback: v => num(v / 1000, 0) + ' k€' } } } } });
+}
+
+function renderProjRisque() {
+  const c = compute(); if (!c.open.length) return $('#projBody').innerHTML = noPos();
+  const R = riskModel(), mc = mcSet(), sh = mc.shock, F = facStore(), mk = mktKey();
+  const imp = l => Math.max(-1, l.b.m * sh.m / 100 + l.b.r * sh.r + l.b.eu * sh.eu + l.b.usd * sh.usd / 100 + l.b.oil * sh.oil / 100 + l.b.vg * sh.vg / 100);
+  const lines = R.lines.map(l => ({ ...l, imp: imp(l) })), totImp = lines.reduce((t, l) => t + l.p.value * l.imp, 0);
+  const CL = climate(), var95 = (T) => R.tot * Math.max(0, 1.645 * R.port.vol * Math.sqrt(T) * CL.k - R.port.mu * T), SC = S.veille && S.veille.scenario && S.veille.scenario.chocs ? S.veille.scenario : null;
+  const mOpts = c.open.map(p => p.asset).filter(a => a.type !== 'action').map(a => `<option value="asset:${a.id}" ${mk === 'asset:' + a.id ? 'selected' : ''}>${esc(nm(a))}</option>`).join('');
+  const st = f => { const w = R.FW[f], d = R.FD[f]; return w && w.length > 100 ? `<span class="tag pos">✓ ${Math.round(w.length / 52 * 10) / 10} ans</span>` : d ? `<span class="tag pos">✓ ${d.length} j.</span>` : '<span class="tag warn">valeurs par défaut</span>'; };
+  const shIn = (k, lab) => `<label>${lab}<input data-shock="${k}" inputmode="decimal" value="${String(sh[k] || 0).replace('.', ',')}"></label>`;
+  const vg = R.port.b.vg, tilt = vg > 0.15 ? ['plutôt « valeur »', 'banques, industrie, énergie : profite quand ces sociétés font mieux que la tech'] : vg < -0.15 ? ['plutôt « croissance »', 'tech et sociétés chères : souffre quand les taux montent ou que la « valeur » reprend la main'] : ['équilibré', 'ni penché vers la tech, ni vers la « valeur »'];
+  const QB = { fiable: 'pos', moyenne: '', 'peu fiable': 'warn', 'défaut': 'warn', 'référence': '' };
+  const wk = c.open.filter(p => (p.asset.weekly || []).length > 104).length;
+  $('#projBody').innerHTML = `${DISC}
+    <div class="kpis">${kpi('Volatilité du portefeuille', pctAbs(R.port.vol), 'par an' + (CL.on && Math.abs(CL.k - 1) > 0.02 ? ' · 1re année ×' + num(CL.k, 2) : ''))}${kpi('Perte « mauvais mois » (VaR 95 %)', '−' + eur(var95(1 / 12)), '1 mois sur 20 peut être pire')}${kpi('Perte « mauvaise année » (VaR 95 %)', '−' + eur(var95(1)), '1 année sur 20 peut être pire')}${kpi('Sensibilité au marché (bêta)', num(R.port.b.m, 2), 'marché −10 % → ' + pct(R.port.b.m * -0.1))}${kpi('Style du portefeuille', tilt[0], R.FW.vg ? 'sensibilité valeur/croissance ' + num(vg, 2) : 'facteur à charger')}</div>
+    ${R.FW.vg ? `<p class="small muted" style="margin-top:-6px">Style : ${tilt[1]}.</p>` : ''}
+    <div class="card"><h3>🎛️ Scénario « et si… »</h3>
+      ${SC ? `<div class="banner info" style="margin-bottom:8px">🧭 <b>Scénario du moment (Tonio, ${fmtDate(S.veille.date)}) :</b> ${esc(SC.nom || '')} — ${esc(SC.explication || '')} <button class="btn sm" data-act="scenapply">Appliquer</button></div>` : ''}
+      <div class="toolbar">${SHOCKS.map(([n], i) => `<button class="btn sm" data-act="preset" data-i="${i}">${n}</button>`).join('')}</div>
+      <div class="form-grid">${shIn('m', 'Marché actions (%)')}${shIn('eu', 'Taux zone euro 10 ans (points)')}${shIn('r', 'Taux US 10 ans (points)')}${shIn('usd', 'Euro face au dollar (%)')}${shIn('oil', 'Pétrole (%)')}${shIn('vg', '« Valeur » vs « croissance » (%)')}</div>
+      <div class="banner ${totImp < 0 ? 'warn' : 'info'}" style="margin-top:10px">Impact estimé sur ton portefeuille : <b class="${cls(totImp)}">${sEur(totImp)}</b> (${pct(R.tot ? totImp / R.tot : null)}).</div>
+      <div class="chartbox"><canvas id="chShock"></canvas></div>
+      <p class="small muted">Taux : 1 = +1 point (ex. de 2,5 % à 3,5 %). « Valeur vs croissance » : +10 = les actions « valeur » font 10 % de mieux que les actions de croissance. Les scénarios historiques reprennent l’ordre de grandeur des mouvements de l’époque. Calcul linéaire : pour les chocs très forts, c’est une approximation.</p></div>
+    <div class="card"><h3>🧬 Ce qui fait bouger chaque ligne</h3><div class="tbl-wrap"><table>
+      <thead><tr><th>Ligne</th><th style="text-align:right">Poids</th><th style="text-align:right">Marché (bêta)</th><th style="text-align:right">Taux €<br>+1 pt</th><th style="text-align:right">Taux $<br>+1 pt</th><th style="text-align:right">Euro<br>+10 %</th><th style="text-align:right">Pétrole<br>+10 %</th><th style="text-align:right">Valeur<br>+10 %</th><th style="text-align:right">Volatilité</th><th style="text-align:right">Part du risque</th><th>Fiabilité</th></tr></thead>
+      <tbody>${lines.sort((x, y) => y.rc - x.rc).map(l => `<tr class="click" data-act="asset" data-id="${l.a.id}"><td>${esc(nm(l.a))}</td><td style="text-align:right">${pctAbs(l.w)}</td><td style="text-align:right">${num(l.b.m, 2)}</td>
+        ${['eu', 'r'].map(f => `<td style="text-align:right" class="${cls(l.b[f])}">${pct(l.b[f])}</td>`).join('')}${['usd', 'oil', 'vg'].map(f => `<td style="text-align:right" class="${cls(l.b[f])}">${pct(l.b[f] * 0.1)}</td>`).join('')}
+        <td style="text-align:right">${pctAbs(l.vol)}</td><td style="text-align:right"><b>${pctAbs(l.rc)}</b></td><td><span class="tag ${QB[l.q] || ''}">${l.q}</span><br><span class="small muted">${l.src}${l.r2 != null ? ' · R² ' + num(l.r2, 2) : ''}</span></td></tr>`).join('')}</tbody></table></div>
+      <p class="small muted">« Part du risque » : contribution de la ligne aux variations du portefeuille. Les lignes en dollars sont mesurées en euros. <b>Fiabilité</b> : <i>fiable</i> = au moins 3 ans de cours hebdomadaires (ou 200 jours) et une sensibilité au marché précise ; <i>moyenne</i> = estimation rapprochée à 30 % de la valeur type de sa classe d’actifs ; <i>peu fiable</i> = rapprochée à 70 % ; <i>défaut</i> = pas assez de données : valeur type (action : bêta 1 ; obligation en euros : −6 % par point de taux ; or : −8 % si l’euro prend 10 %…).</p></div>
+    <div class="card"><h3>📡 Données</h3>
+      <div class="form-grid"><label>Référence « marché »<select id="mktSel">${mOpts}<option value="sym:SPY" ${mk === 'sym:SPY' ? 'selected' : ''}>S&P 500 (SPY, Alpha Vantage)</option><option value="sym:URTH" ${mk === 'sym:URTH' ? 'selected' : ''}>MSCI World en dollars (URTH, Alpha Vantage)</option></select></label></div>
+      <p class="small">Marché ${st('m')} · Taux zone euro (BCE) ${st('eu')} · Euro/dollar (BCE) ${st('usd')} · Taux US ${st('r')} · Pétrole ${st('oil')} · Valeur/croissance ${st('vg')} ${F.at ? '<span class="muted">· chargés le ' + fmtDate(F.at) + '</span>' : ''}</p>
+      <p class="small">Historique 5 ans de tes lignes : <b>${wk}/${c.open.length}</b> · liens entre facteurs calculés en ${R.covSrc}${R.covN ? ' (' + R.covN + ' points)' : ''}.</p>
+      <div class="toolbar" style="margin:0"><button class="btn sm primary" data-act="facload">📥 Charger / actualiser les facteurs</button><button class="btn sm" data-act="weekload">📥 Historique 5 ans de mes lignes (1 requête par ligne)</button></div>
+      <p class="small muted">Facteurs : taux de la zone euro et euro/dollar viennent de la BCE (gratuit, sans clé) ; taux US, pétrole et valeur/croissance (ETF S&P 500 Value et Growth) d’Alpha Vantage : 4 requêtes (6 si la référence marché est SPY ou URTH). Une fois par semaine suffit. Historique des lignes : 10 lignes maximum par clic ; avec la limite gratuite de 25 requêtes par jour, étale sur deux jours si besoin, puis une fois par mois.</p></div>`;
+  const top = lines.filter(l => Math.abs(l.p.value * l.imp) > 0.5).sort((x, y) => x.p.value * x.imp - y.p.value * y.imp).slice(0, 12);
+  mkChart('chShock', { type: 'bar', data: { labels: top.map(l => nm(l.a)), datasets: [{ label: 'Impact (€)', data: top.map(l => +(l.p.value * l.imp).toFixed(2)), backgroundColor: top.map(l => l.imp < 0 ? '#c62828' : '#2e7d32') }] },
+    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: x => sEur(x.raw) } } } } });
+}
+
+/* ---------- Transparence des ETF ---------- */
+const normCo = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\(.*?\)/g, '').replace(/\b(inc|corp|corporation|co|ltd|plc|sa|nv|se|ag|holding|holdings|group|groupe|class [abc]|cl [abc]|the|company)\b\.?/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+function topOf(a) {         // « Apple 4,8; Microsoft 4,5 » → [[nom, part 0-1]] (non normalisé : % de l'ETF)
+  const out = []; String(a.topHold || '').split(/[;\n]+/).forEach(part => { const m = part.trim().match(/^(.+?)[\s:=]+(\d+(?:[.,]\d+)?)\s*%?$/); if (m) { const v = parseNum(m[2]); if (v > 0) out.push([m[1].trim(), v / 100]); } }); return out;
+}
+function etfPrompt(a) {
+  return [`Tonio, donne-moi la composition actuelle de cet ETF : ${nm(a)}${a.isin ? ' (ISIN ' + a.isin + ')' : ''}${a.symbol ? ', symbole ' + a.symbol : ''}.`,
+    'Cherche la fiche officielle de l’émetteur (ou justETF) et indique la date des données. Réponds avec exactement ces 4 lignes, prêtes à coller dans mon app (pourcentages en nombres, séparés par des points-virgules) :',
+    'Régions : États-Unis 70; Japon 6; Royaume-Uni 4; …', 'Secteurs : Technologie 25; Finance 15; …', 'Principales lignes : Apple 4,8; Microsoft 4,5; … (les 15 premières)', 'Frais (TER) : 0,20',
+    'Ajoute ensuite 3 phrases : ce que l’ETF réplique, sa méthode (physique / synthétique, distribution / capitalisation) et un point d’attention. Ce n’est pas un conseil en investissement.'].join('\n');
+}
+function renderProjEtf() {
+  const c = compute(), etfs = c.open.filter(p => ['etf', 'fonds'].includes(p.asset.type));
+  if (!etfs.length) return $('#projBody').innerHTML = `<div class="card empty"><h2>Aucun ETF en portefeuille</h2><p>Cette vue montre ce que contiennent réellement tes ETF et fonds.</p></div>`;
+  const expo = new Map(), add = (name, key, v, via) => { const k = normCo(key || name); if (!k) return; const e = expo.get(k) || { name, direct: 0, etf: 0, via: new Set() }; if (via) { e.etf += v; e.via.add(via); } else { e.direct += v; e.name = name; } expo.set(k, e); };
+  c.open.filter(p => p.asset.type === 'action').forEach(p => add(nm(p.asset), nm(p.asset), p.value, null));
+  etfs.forEach(p => topOf(p.asset).forEach(([n, w]) => add(n, n, p.value * w, nm(p.asset))));
+  const tot = c.T.value + (c.hasCash ? c.cash : 0), ex = [...expo.values()].map(e => ({ ...e, t: e.direct + e.etf })).sort((x, y) => y.t - x.t).slice(0, 15);
+  const fees = etfs.reduce((t, p) => t + (p.asset.ter != null ? p.value * p.asset.ter : 0), 0), feesKnown = etfs.filter(p => p.asset.ter != null).length;
+  const pairs = []; for (let i = 0; i < etfs.length; i++) for (let j = i + 1; j < etfs.length; j++) {
+    const A = new Map(topOf(etfs[i].asset).map(([n, w]) => [normCo(n), w])), B = topOf(etfs[j].asset); if (!A.size || !B.length) continue;
+    const ov = B.reduce((t, [n, w]) => t + (A.has(normCo(n)) ? Math.min(w, A.get(normCo(n))) : 0), 0); pairs.push([nm(etfs[i].asset), nm(etfs[j].asset), ov]);
+  }
+  const done = p => [p.asset.regionSplit, p.asset.sectorSplit, p.asset.topHold, p.asset.ter != null].filter(Boolean).length;
+  $('#projBody').innerHTML = `
+    <div class="kpis">${kpi('ETF / fonds', String(etfs.length), etfs.filter(p => done(p) === 4).length + ' entièrement renseignés')}${kpi('Frais annuels des ETF', feesKnown ? eur(fees) : '–', feesKnown ? `${feesKnown}/${etfs.length} TER connus` : 'renseigne les TER')}${kpi('Plus grosse société (réelle)', ex[0] ? esc(ex[0].name) : '–', ex[0] ? pctAbs(ex[0].t / tot) + ' du portefeuille' : '')}</div>
+    <div class="card"><h3>🔍 Mes vraies expositions par société <span class="muted small">(lignes directes + contenu des ETF)</span></h3>
+      ${ex.length ? `<div class="tbl-wrap"><table><thead><tr><th>Société</th><th style="text-align:right">En direct</th><th style="text-align:right">Via ETF</th><th style="text-align:right">Total</th><th style="text-align:right">% portefeuille</th><th>Via</th></tr></thead>
+      <tbody>${ex.map(e => `<tr><td>${esc(e.name)}</td><td style="text-align:right">${e.direct ? eur(e.direct) : '–'}</td><td style="text-align:right">${e.etf ? eur(e.etf) : '–'}</td><td style="text-align:right"><b>${eur(e.t)}</b></td><td style="text-align:right">${pctAbs(e.t / tot)}</td><td class="small muted">${[...e.via].map(esc).join(', ')}</td></tr>`).join('')}</tbody></table></div>
+      <p class="small muted">Basé sur les principales lignes de chaque ETF (souvent les 10 à 15 premières) : l’exposition réelle est un peu plus élevée.</p>` : '<p class="muted">Renseigne les « principales lignes » de tes ETF ci-dessous pour voir tes vraies expositions.</p>'}
+      ${pairs.length ? `<h4>Chevauchement entre ETF</h4><ul class="small">${pairs.sort((x, y) => y[2] - x[2]).map(([a, b, o]) => `<li>${esc(a)} ↔ ${esc(b)} : au moins <b>${pctAbs(o)}</b> en commun ${o > 0.3 ? '<span class="tag warn">fort recouvrement</span>' : ''}</li>`).join('')}</ul>` : ''}
+      <p class="small">Les répartitions par région et secteur de tes ETF sont aussi utilisées dans l’onglet <a href="#" data-act="tab" data-tab="repartition">🧩 Répartition</a>.</p></div>
+    ${etfs.map(p => { const a = p.asset; return `<div class="card"><h3 style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>${esc(nm(a))} <span class="muted small">${esc(a.isin || a.symbol || '')}</span></span><span class="small">${pctAbs(p.weight)} du portefeuille · ${done(p)}/4 renseignés</span></h3>
+      <div class="form-grid">
+        <label>Régions (ex. États-Unis 70; Japon 6)<textarea data-etf="regionSplit" data-id="${a.id}" rows="2">${esc(a.regionSplit || '')}</textarea></label>
+        <label>Secteurs (ex. Technologie 25; Finance 15)<textarea data-etf="sectorSplit" data-id="${a.id}" rows="2">${esc(a.sectorSplit || '')}</textarea></label>
+        <label>Principales lignes (ex. Apple 4,8; Microsoft 4,5)<textarea data-etf="topHold" data-id="${a.id}" rows="3">${esc(a.topHold || '')}</textarea></label>
+        <label>Frais annuels TER (%)<input data-etf="ter" data-id="${a.id}" inputmode="decimal" value="${a.ter != null ? String(+(a.ter * 100).toFixed(3)).replace('.', ',') : ''}" placeholder="ex. 0,20"></label>
+      </div>
+      <div class="toolbar" style="margin:8px 0 0"><button class="btn sm" data-act="etfask" data-id="${a.id}">🤖 Demander la composition à Claude</button><button class="btn sm" data-act="etfpaste" data-id="${a.id}">📋 Coller la réponse de Claude</button></div></div>`; }).join('')}`;
+}
+function applyEtfText(a, txt) {
+  let n = 0;
+  String(txt).split(/\n+/).forEach(l => {
+    const m = l.match(/^\s*[-*•]?\s*(r[ée]gions?|secteurs?|principales? lignes?|frais.*?|ter)\s*[:：]\s*(.+)$/i); if (!m) return;
+    const k = m[1].toLowerCase(), v = m[2].replace(/\s*\(.*?\)\s*$/, '').trim();
+    if (/^r/.test(k)) { a.regionSplit = v; n++; } else if (/^s/.test(k)) { a.sectorSplit = v; n++; } else if (/^p/.test(k)) { a.topHold = v; n++; }
+    else { const t = parseNum(v.replace('%', '')); if (t >= 0 && t < 5) { a.ter = t / 100; n++; } }
+  });
+  return n;
+}
+
+/* ---------- Veille Tonio ---------- */
+let retourDir = null, veilleTried = false;
+const SENT = { '-2': ['très négative', 'neg'], '-1': ['plutôt négative', 'neg'], '0': ['neutre', ''], '1': ['plutôt positive', 'pos'], '2': ['très positive', 'pos'] };
+function veilleFor(a) {
+  const V = S.veille; if (!V || !V.items) return null;
+  return V.items.find(x => (x.symbole && a.symbol && x.symbole.toUpperCase() === a.symbol.toUpperCase()) || (x.isin && a.isin && x.isin === a.isin) || (x.nom && normCo(x.nom) === normCo(nm(a)))) || null;
+}
+async function readVeille(manual) {
+  try {
+    if (!retourDir) retourDir = (await IDB.get('retourDir')) || null;
+    if (!retourDir) { if (manual) await pickRetour(); if (!retourDir) return; }
+    let perm = await retourDir.queryPermission({ mode: 'read' });
+    if (perm !== 'granted') { if (!manual) return; perm = await retourDir.requestPermission({ mode: 'read' }); if (perm !== 'granted') return toast('Accès au dossier refusé.', 'err'); }
+    let best = null;
+    for await (const [name, h] of retourDir.entries()) { const m = name.match(/^bourse_veille_(\d{4}-\d{2}-\d{2})(?:_(\d+))?\.json$/); if (m && h.kind === 'file') { const k = m[1] + (m[2] || '0').padStart(3, '0'); if (!best || k > best.k) best = { k, h, name }; } }
+    if (!best) { if (manual) toast('Aucun fichier bourse_veille_… dans ce dossier pour l’instant (la première veille arrive la nuit prochaine).'); return; }
+    if (S.veille && S.veille.file === best.name && !manual) return;
+    const j = JSON.parse(await (await best.h.getFile()).text());
+    S.veille = { ...j, file: best.name, readAt: new Date().toISOString() }; save(); renderAll();
+    if (manual) toast('✅ Veille du ' + fmtDate(j.date) + ' chargée (' + (j.items || []).length + ' titres).');
+  } catch (e) { if (manual) toast('Lecture de la veille impossible : ' + e.message, 'err'); }
+}
+async function pickRetour() {
+  if (!window.showDirectoryPicker) return toast('Utilise Chrome ou Edge sur le PC pour lire un dossier.', 'err');
+  try {
+    const h = await window.showDirectoryPicker({ id: 'retour', mode: 'read' });
+    if (/coffre/i.test(h.name)) return toast('Ce dossier s’appelle « ' + h.name + ' » : choisis Tonio_retour, jamais le Coffre.', 'err');
+    if (!/retour/i.test(h.name) && !confirm('Ce dossier s’appelle « ' + h.name + ' ». Est-ce bien Tonio_retour ?')) return;
+    retourDir = h; await IDB.set('retourDir', h);
+  } catch (e) { if (e.name !== 'AbortError') toast('Erreur : ' + e.message, 'err'); }
+}
+function veilleCard(x) {
+  const a = S.assets.find(a => veilleFor(a) === x), s = SENT[String(Math.max(-2, Math.min(2, Math.round(+x.sentiment || 0))))];
+  const link = (t, u) => u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(t || 'source')}</a>` : esc(t || '');
+  return `<div class="card"><h3 style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>${esc(x.nom || x.symbole)} <span class="muted small">${esc(x.symbole || '')}</span></span><span class="tag ${s[1]}">Actualité ${s[0]}</span></h3>
+    ${x.resume ? `<p>${esc(x.resume)}</p>` : ''}
+    ${(x.faits || []).length ? `<h4 style="margin:8px 0 4px">Faits datés</h4><ul class="small">${x.faits.map(f => `<li><b>${esc(f.date || '')}</b> — ${esc(f.texte)} <span class="muted">(${link(f.source, f.url)})</span></li>`).join('')}</ul>` : ''}
+    ${(x.a_venir || []).length ? `<h4 style="margin:8px 0 4px">📅 À venir</h4><ul class="small">${x.a_venir.map(f => `<li><b>${esc(f.date || '')}</b> — ${esc(f.texte)}</li>`).join('')}</ul>` : ''}
+    ${(x.risques || []).length ? `<h4 style="margin:8px 0 4px">⚠️ Points de vigilance</h4><ul class="small">${x.risques.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+    ${(x.questions || []).length ? `<h4 style="margin:8px 0 4px">❓ Questions à te poser</h4><ul class="small">${x.questions.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+    ${a ? `<div class="toolbar" style="margin:6px 0 0">${a.type === 'action' ? `<button class="btn sm" data-act="socopen" data-id="${a.id}">🏢 Fiche société</button>` : ''}<button class="btn sm" data-act="asset" data-id="${a.id}">Détail / graphique</button></div>` : ''}</div>`;
+}
+function renderProjVeille() {
+  const V = S.veille, age = V && V.date ? Math.round((Date.now() - new Date(V.date + 'T12:00:00')) / 864e5) : null;
+  if (!veilleTried) { veilleTried = true; readVeille(false); }
+  const items = V && V.items ? [...V.items].sort((x, y) => (+x.sentiment || 0) - (+y.sentiment || 0)) : [];
+  $('#projBody').innerHTML = `
+    <p class="disclaimer">Chaque nuit (du mardi au samedi), Tonio cherche sur le web l’actualité datée de tes sociétés et ETF (y compris ceux « à analyser ») et dépose un fichier <b>bourse_veille_AAAA-MM-JJ.json</b> dans ton dossier Tonio_retour. Faits sourcés d’un côté, points de vigilance et questions de l’autre ; jamais d’avis d’achat ou de vente. Ce n’est pas un conseil en investissement.</p>
+    <div class="toolbar"><button class="btn primary" data-act="veilleread">🔄 Lire la dernière veille</button><button class="btn" data-act="veillepick">📁 Choisir le dossier Tonio_retour</button><button class="btn" data-act="veillepaste">📋 Coller une veille</button></div>
+    ${V ? `<div class="banner ${age > 3 ? 'warn' : 'info'}">Veille du <b>${fmtDate(V.date)}</b>${age > 3 ? ` (il y a ${age} jours)` : ''} · ${items.length} titre(s)${V.marche && V.marche.resume ? ` · <b>Marché :</b> ${esc(V.marche.resume)}` : ''}</div>
+      ${items.map(veilleCard).join('')}` : `<div class="card empty"><h2>Pas encore de veille</h2><p>Choisis une fois le dossier <b>Tonio_retour</b> (celui de Google Drive sur ton PC) : l’app lira ensuite la dernière veille toute seule.</p></div>`}`;
+}
+
+/* ---------- Événements ---------- */
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  const act = b.dataset.act, a = b.dataset.id ? assetById(b.dataset.id) : null, mc = () => mcSet();
+  const H = {
+    projmode: () => { S.settings.projMode = b.dataset.mode; persist(); renderProjections(); },
+    facload: () => loadFactors(),
+    weekload: () => loadWeeklyLines(),
+    preset: () => { mc().shock = { ...SHOCKS[+b.dataset.i][1] }; persist(); renderProjections(); },
+    mcreset: () => { mc().mu = { ...MU_DEF }; mc().monthly = 0; persist(); renderProjections(); },
+    etfask: () => a && openModal(`<h2>🤖 Composition de l’ETF avec Claude</h2><p class="small">Copie, colle dans Claude (projet Tonio), puis reviens coller sa réponse avec « 📋 Coller la réponse de Claude ».</p><textarea id="askTxt" style="width:100%;min-height:220px;font-size:13px">${esc(etfPrompt(a))}</textarea><div class="modal-actions"><button class="btn primary" data-act="askgo">📋 Copier et ouvrir Claude</button><button class="btn" data-act="closemodal2">Fermer</button></div>`),
+    etfpaste: () => a && openModal(`<h2>📋 Réponse de Claude pour ${esc(nm(a))}</h2><p class="small">Colle toute la réponse : l’app reprend les lignes « Régions », « Secteurs », « Principales lignes » et « Frais (TER) ».</p><textarea id="etfTxt" style="width:100%;min-height:200px"></textarea><div class="modal-actions"><button class="btn primary" data-act="etfapply" data-id="${a.id}">Appliquer</button><button class="btn" data-act="closemodal2">Annuler</button></div>`),
+    etfapply: () => { if (!a) return; const n = applyEtfText(a, $('#etfTxt').value); if (!n) return toast('Je n’ai trouvé aucune ligne « Régions : … », « Secteurs : … », « Principales lignes : … » ou « Frais (TER) : … ».', 'err'); closeModal(); riskCache = null; save(); renderAll(); toast(`✅ ${n} information(s) enregistrée(s) pour ${nm(a)}.`); },
+    veilleread: () => readVeille(true),
+    veillepick: async () => { await pickRetour(); if (retourDir) readVeille(true); },
+    veillepaste: () => openModal(`<h2>📋 Coller une veille</h2><p class="small">Colle le contenu JSON d’un fichier bourse_veille_….json.</p><textarea id="veilleTxt" style="width:100%;min-height:220px;font-family:monospace;font-size:12px"></textarea><div class="modal-actions"><button class="btn primary" data-act="veilleapply">Charger</button><button class="btn" data-act="closemodal2">Annuler</button></div>`),
+    veilleapply: () => { try { const j = JSON.parse($('#veilleTxt').value); if (!Array.isArray(j.items)) throw new Error('champ « items » absent'); S.veille = { ...j, file: 'collé', readAt: new Date().toISOString() }; closeModal(); save(); renderAll(); toast('✅ Veille chargée.'); } catch (err) { toast('JSON invalide : ' + err.message, 'err'); } }
+  };
+  if (H[act]) { e.stopImmediatePropagation(); e.preventDefault(); await H[act](); }
+}, true);
+document.addEventListener('change', e => {
+  const t = e.target, d = t.dataset || {};
+  if (d.mcmu != null || d.mcmonthly != null || d.shock) {
+    const v = socNum(t.value); if (Number.isNaN(v)) return toast('Nombre invalide.', 'err');
+    const mc = mcSet();
+    if (d.mcmu) mc.mu[d.mcmu] = v == null ? MU_DEF[d.mcmu] : v / 100;
+    else if (d.mcmonthly != null) mc.monthly = Math.max(0, v || 0);
+    else mc.shock[d.shock] = v || 0;
+    persist(); renderProjections();
+  } else if (d.etf) {
+    const a = assetById(d.id); if (!a) return;
+    if (d.etf === 'ter') { const v = socNum(t.value); if (Number.isNaN(v)) return toast('Nombre invalide.', 'err'); if (v == null) delete a.ter; else a.ter = v / 100; }
+    else a[d.etf] = t.value.trim();
+    riskCache = null; save(); renderAll();
+  } else if (t.id === 'mktSel') { facStore().mkt = t.value; riskCache = null; save(); renderAll(); if (t.value.startsWith('sym:') && !(S.factors.s.m)) toast('Clique « 📥 Charger / actualiser » pour télécharger cette référence.'); }
+}, true);
+
+
+/* ============================================================================
+   V1.7 — 🌍 Macro & climat : tableau macro (Tonio, chaque nuit), nervosité des
+   marchés (VIX via la feuille Google), risque géopolitique (indice GPR),
+   agenda, « scénario du moment » chiffré et fourchettes adaptées au climat.
+   ============================================================================ */
+const VIX_SYM = 'INDEXCBOE:VIX', VIX_AVG = 19.5;
+function climate() {
+  const C = S.climate || {}, V = S.veille || {}, M = V.macro || {}, nv = M.nervosite || {};
+  let vix = null, vixSrc = '', vixDate = null;
+  if (C.vix > 0 && C.vixAt && Date.now() - new Date(C.vixAt).getTime() < 3 * 864e5) { vix = C.vix; vixSrc = 'feuille Google (direct)'; vixDate = C.vixAt; }
+  else if (nv.vix && +nv.vix.valeur > 0) { vix = +nv.vix.valeur; vixSrc = 'veille Tonio'; vixDate = nv.vix.date || V.date; }
+  const gpr = V.gpr && +V.gpr.valeur > 0 ? +V.gpr.valeur : null;
+  let k = vix ? Math.max(0.8, Math.min(1.8, vix / VIX_AVG)) : 1;
+  if (gpr) k *= gpr > 200 ? 1.2 : gpr > 150 ? 1.1 : 1;
+  k = Math.max(0.8, Math.min(2, k));
+  const on = mcSet().climat !== false && (vix || gpr);
+  const reg = !vix ? ['inconnu', ''] : vix < 15 ? ['calme', 'pos'] : vix < 22 ? ['normal', ''] : vix < 30 ? ['nerveux', 'warn'] : ['forte tension', 'neg'];
+  return { vix, vixSrc, vixDate, gpr, k: on ? k : 1, kRaw: k, on, reg };
+}
+/** Variance cumulée sur T années : la 1re année au rythme du climat actuel, ensuite au rythme habituel. */
+function climVar(vol, T) { const k = climate().k; return vol * vol * (k * k * Math.min(T, 1) + Math.max(T - 1, 0)); }
+
+/* ---------- Vue « Macro & climat » ---------- */
+function renderProjMacro() {
+  const V = S.veille || null, M = (V && V.macro) || {}, cl = climate(), mc = mcSet(), sc = V && V.scenario;
+  const age = V && V.date ? Math.round((Date.now() - new Date(V.date + 'T12:00:00')) / 864e5) : null;
+  const link = (t, u) => u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(t || 'source')}</a>` : esc(t || '');
+  const tend = t => ({ hausse: '↗︎', baisse: '↘︎', stable: '→' })[String(t || '').toLowerCase()] || '';
+  const tbl = (rows, titre) => (rows || []).length ? `<div class="card"><h3>${titre}</h3><div class="tbl-wrap"><table><thead><tr><th>Indicateur</th><th style="text-align:right">Valeur</th><th>Tendance</th><th>Date</th><th>Source</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${esc(r.nom)}</td><td style="text-align:right"><b>${esc(String(r.valeur ?? '–'))}</b></td><td>${tend(r.tendance)} ${esc(r.tendance || '')}</td><td class="small">${esc(r.date || '')}</td><td class="small">${link(r.source, r.url)}</td></tr>`).join('')}</tbody></table></div></div>` : '';
+  const nv = M.nervosite || {}, ag = ((V && V.agenda) || []).filter(x => !x.date || x.date >= today()).sort((a, b) => (a.date || '') < (b.date || '') ? -1 : 1).slice(0, 15);
+  $('#projBody').innerHTML = `
+    <p class="disclaimer">Les indicateurs macro, le risque géopolitique, l’agenda et le scénario du moment sont préparés chaque nuit par Tonio (recherches web, sources citées) dans le fichier de veille. La nervosité (VIX) vient aussi en direct de ta feuille Google. Ce n’est pas un conseil en investissement.</p>
+    ${!V ? '<div class="banner warn">Pas encore de veille : choisis le dossier Tonio_retour dans « 📰 Veille Tonio ». La première arrive la nuit prochaine.</div>' : age > 3 ? `<div class="banner warn">Veille du ${fmtDate(V.date)} (il y a ${age} jours) : les chiffres macro peuvent avoir changé.</div>` : ''}
+    <div class="kpis">
+      ${kpi('Nervosité des marchés (VIX)', cl.vix ? num(cl.vix, 1) : '–', cl.vix ? `<span class="tag ${cl.reg[1]}">${cl.reg[0]}</span> · ${cl.vixSrc}` : 'à charger (feuille Google ou veille)')}
+      ${kpi('Risque géopolitique (GPR)', cl.gpr ? num(cl.gpr, 0) : '–', cl.gpr ? `${V.gpr.mois || ''} · moyenne historique 100` : 'fourni par la veille')}
+      ${kpi('Effet sur les fourchettes', cl.on ? (cl.k >= 1 ? '+' : '') + pctAbs(cl.k - 1).replace('-', '−') : 'aucun', cl.on ? 'volatilité des 12 prochains mois' : (mc.climat === false ? 'désactivé' : 'pas de donnée'))}
+      ${kpi('Événements à venir', String(ag.length), ag[0] ? 'prochain : ' + esc(ag[0].date || '') : '')}
+    </div>
+    <div class="card"><h3>🌡️ Le climat et tes fourchettes</h3>
+      <label class="chk"><input type="checkbox" id="climOn" ${mc.climat !== false ? 'checked' : ''}> Adapter les fourchettes au climat actuel (pages Par société, Portefeuille entier et Risque)</label>
+      <p class="small">Le VIX mesure la nervosité attendue sur la bourse américaine (moyenne de long terme ≈ 19,5). Quand il est haut, les marchés bougent davantage : la volatilité utilisée pour les 12 prochains mois est multipliée par VIX ÷ 19,5 (entre ×0,8 et ×1,8), puis +10 % si le risque géopolitique dépasse 150 (+20 % au-delà de 200). Au-delà d’un an, on revient au rythme habituel. Multiplicateur actuel : <b>×${num(cl.kRaw, 2)}</b>.</p>
+      ${M.lecture ? `<p><b>Lecture de Tonio :</b> ${esc(M.lecture)}</p>` : ''}</div>
+    ${sc ? `<div class="card"><h3>🧭 Scénario du moment : ${esc(sc.nom || '')} <span class="muted small">${sc.vraisemblance ? '· vraisemblance ' + esc(sc.vraisemblance) : ''}</span></h3>
+      <p>${esc(sc.explication || '')}</p>
+      <p class="small">Chocs proposés : marché ${pct((+sc.chocs?.m || 0) / 100)} · taux zone euro ${(+sc.chocs?.eu || 0) >= 0 ? '+' : ''}${num(+sc.chocs?.eu || 0, 2)} pt · taux US ${(+sc.chocs?.r || 0) >= 0 ? '+' : ''}${num(+sc.chocs?.r || 0, 2)} pt · euro/dollar ${pct((+sc.chocs?.usd || 0) / 100)} · pétrole ${pct((+sc.chocs?.oil || 0) / 100)}</p>
+      ${(sc.sources || []).length ? `<p class="small muted">Sources : ${sc.sources.map(s => link(s.source, s.url)).join(' · ')}</p>` : ''}
+      <button class="btn sm primary" data-act="scenapply">⚡ Voir l’impact sur mon portefeuille</button></div>` : ''}
+    ${tbl(M.zone_euro, '🇪🇺 Zone euro')}${tbl(M.etats_unis, '🇺🇸 États-Unis')}
+    ${Object.keys(nv).length ? `<div class="card"><h3>😬 Nervosité et crédit</h3><div class="mgrid">${Object.entries(nv).map(([k, x]) => `<div class="m"><div class="l">${esc({ vix: 'VIX (États-Unis)', vstoxx: 'VSTOXX (Europe)', spread_hy_euro: 'Écart de crédit à haut rendement (euro)', spread_ig_euro: 'Écart de crédit de qualité (euro)' }[k] || k)}</div><div class="v">${esc(String(x.valeur ?? '–'))}</div><div class="small muted">${esc(x.date || '')}</div></div>`).join('')}</div></div>` : ''}
+    ${V && V.gpr ? `<div class="card"><h3>🌐 Risque géopolitique</h3><p>Indice GPR (Caldara & Iacoviello, articles de presse sur les tensions, guerres et menaces) : <b>${num(+V.gpr.valeur, 0)}</b> pour ${esc(V.gpr.mois || '')} (100 = moyenne historique). ${esc(V.gpr.lecture || '')} <span class="small muted">${link(V.gpr.source, V.gpr.url)}</span></p></div>` : ''}
+    ${ag.length ? `<div class="card"><h3>📅 Agenda des marchés</h3><ul>${ag.map(x => `<li><b>${esc(x.date || '')}</b> — ${esc(x.texte)} ${x.importance === 'haute' ? '<span class="tag warn">important</span>' : ''}</li>`).join('')}</ul></div>` : ''}`;
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-act="scenapply"]'); if (!b) return;
+  e.stopImmediatePropagation(); e.preventDefault();
+  const sc = S.veille && S.veille.scenario; if (!sc || !sc.chocs) return;
+  mcSet().shock = { ...SH0, ...Object.fromEntries(FK.map(k => [k, +sc.chocs[k] || 0])) };
+  S.settings.projMode = 'risque'; persist(); renderProjections(); scrollTo({ top: 0, behavior: 'smooth' });
+}, true);
+document.addEventListener('change', e => { if (e.target.id === 'climOn') { mcSet().climat = e.target.checked; persist(); renderProjections(); } }, true);
+
+
+/* ============================================================================
+   V1.9 — 🧭 PISTES DE DÉCISION
+   Règles transparentes appliquées aux projections, au risque, à la veille et à
+   tes limites : « à étudier : renforcer / alléger / entrer », avec les raisons.
+   Ce ne sont pas des conseils : l'app ne connaît ni ta situation, ni l'avenir.
+   ============================================================================ */
+const PISTE = {
+  renforcer: ['À étudier : renforcer', 'pos'], alleger: ['À étudier : alléger', 'neg'], conserver: ['Conserver / surveiller', ''],
+  entrer: ['À étudier : entrer', 'pos'], attendre: ['Continuer l’analyse', ''], eviter: ['Pas maintenant', 'warn'], inconnu: ['Données insuffisantes', 'warn']
+};
+function pisteSet() { S.settings.piste = Object.assign({ maxAction: 0.10, maxEtf: 0.40, rendMin: 0.08, upMin: 0.15, gainLock: 0.5 }, S.settings.piste || {}); return S.settings.piste; }
+function pisteOf(a, c, R) {
+  const P = pisteSet(), p = c.by[a.id], held = p.qty > 0, pts = [], add = (s, t) => pts.push({ s, t });
+  const line = R && R.lines.find(l => l.a.id === a.id);
+  if (a.type === 'action') {
+    const X = projCalc(a), p0 = X.F.price, r3 = X.rows[3];
+    if (p0 > 0 && r3 && r3.fond) {
+      const ra = annual(r3.fond.c, p0, 3);
+      if (r3.fond.o < p0) add(-1.5, `Même le scénario optimiste « bénéfices × PER » à 3 ans (${money(r3.fond.o, a.ccy)}) est sous le cours actuel : le prix suppose une croissance plus forte que tes hypothèses.`);
+      else if (ra != null && ra >= P.rendMin) add(1, `Scénario central « bénéfices × PER » : ${pct(ra)} par an sur 3 ans (seuil ${pctAbs(P.rendMin)}).`);
+      else if (ra != null && ra < 0) add(-1, `Scénario central « bénéfices × PER » : ${pct(ra)} par an sur 3 ans.`);
+      else if (ra != null) add(0, `Scénario central « bénéfices × PER » : ${pct(ra)} par an sur 3 ans (sous ton seuil de ${pctAbs(P.rendMin)}).`);
+    }
+    if (p0 > 0 && X.F.target != null) {
+      const up = X.F.target / p0 - 1;
+      if (up >= P.upMin) add(1, `Objectif moyen des analystes ${pct(up)} au-dessus du cours (souvent optimiste).`);
+      else if (up <= -0.05) add(-1, `Le cours dépasse l’objectif moyen des analystes (${pct(up)}).`);
+    }
+  }
+  const L = lecture(a, held ? p : null);
+  if (L.cls === 'pos') add(0.5, 'Tendance du cours favorable (au-dessus de ses moyennes mobiles).');
+  else if (L.cls === 'neg') add(-0.5, 'Tendance du cours défavorable (sous ses moyennes mobiles).');
+  const v = veilleFor(a);
+  if (v && +v.sentiment) add(+v.sentiment >= 2 ? 1 : +v.sentiment <= -2 ? -1 : +v.sentiment * 0.5, `Actualité ${SENT[String(Math.max(-2, Math.min(2, Math.round(+v.sentiment))))][0]} (veille du ${fmtDate(S.veille.date)}) : ${v.resume || ''}`);
+  if (held) {
+    const max = a.type === 'action' ? P.maxAction : P.maxEtf;
+    if (p.weight > max) add(-1, `Pèse ${pctAbs(p.weight)} du portefeuille, au-dessus de ta limite de ${pctAbs(max)} par ${a.type === 'action' ? 'action' : 'ligne'}.`);
+    if (line && line.rc > 2 * line.w && line.rc > 0.1) add(-1, `Porte ${pctAbs(line.rc)} du risque total pour ${pctAbs(line.w)} du poids.`);
+    if (p.pctLatent > P.gainLock && p.weight > 0.7 * max) add(-0.5, `Plus-value latente de ${pct(p.pctLatent)} sur une ligne déjà lourde : sécuriser une partie ?`);
+    if (pts.some(x => x.s > 0) && p.weight > max * 0.9) add(-0.5, 'Déjà proche de ta limite de poids : peu de place pour renforcer.');
+  }
+  const score = pts.reduce((t, x) => t + x.s, 0), n = pts.filter(x => x.s !== 0).length;
+  let k = n < 2 ? (held ? 'conserver' : 'inconnu') : held ? (score >= 1.5 ? 'renforcer' : score <= -1.5 ? 'alleger' : 'conserver') : (score >= 1.5 ? 'entrer' : score <= -1 ? 'eviter' : 'attendre');
+  if (n < 2) pts.push({ s: 0, t: !(a.price > 0) ? 'Pas de cours récent : actualise les cours.' : a.type === 'action' ? 'Peu d’éléments pour juger : renseigne le BPA (page Sociétés) ou attends la veille de Tonio.' : 'Pour un ETF, la piste repose surtout sur tes limites de poids, le risque et la veille : rien de marquant pour l’instant.' });
+  return { a, p, held, k, score, pts };
+}
+function pistes() {
+  const c = compute(); let R = null; try { R = riskModel(); } catch (e) { R = null; }
+  const L = S.assets.filter(a => c.by[a.id].qty > 0 ? ['action', 'etf', 'fonds'].includes(a.type) : (a.analyse && a.type === 'action'));
+  return L.map(a => pisteOf(a, c, R)).sort((x, y) => (y.held - x.held) || Math.abs(y.score) - Math.abs(x.score));
+}
+function renderPistes() {
+  const c = compute(), L = pistes(), P = pisteSet(), cl = climate(), yr = String(new Date().getFullYear()), ry = c.realizedYear[yr] || 0;
+  const cnt = k => L.filter(x => x.k === k).length;
+  const bar = s => { const w = Math.min(50, Math.abs(s) * 12); return `<div style="position:relative;height:8px;background:var(--line);border-radius:4px;min-width:90px"><div style="position:absolute;top:0;height:8px;border-radius:4px;${s >= 0 ? 'left:50%' : 'right:50%'};width:${w}%;background:${s >= 0 ? '#2e7d32' : '#c62828'}"></div></div><div class="small muted" style="text-align:center">${s > 0 ? '+' : ''}${num(s, 1)}</div>`; };
+  const inp = (k, lab, pc) => `<label>${lab}<input data-piste="${k}" inputmode="decimal" value="${String(+(P[k] * (pc ? 100 : 1)).toFixed(2)).replace('.', ',')}"></label>`;
+  $('#v-pistes').innerHTML = `
+    <div class="banner warn"><b>Ce ne sont pas des conseils d’investissement.</b> Ces pistes appliquent des règles simples et visibles à tes projections, ton risque, la veille de Tonio et tes propres limites. Elles ne connaissent ni ta situation, ni tes autres placements, ni l’avenir : elles te disent quoi <span style="font-weight:700">regarder de plus près</span>, jamais quoi faire. La décision t’appartient.</div>
+    <div class="kpis">${kpi('À étudier : renforcer', String(cnt('renforcer')), 'lignes détenues')}${kpi('À étudier : alléger', String(cnt('alleger')), 'lignes détenues')}${kpi('À étudier : entrer', String(cnt('entrer')), 'sociétés « à analyser »')}${kpi('Plus-values réalisées ' + yr, eur(ry), 'exonération restante ' + eur(Math.max(0, CG_EXEMPTION - Math.max(0, ry))))}</div>
+    ${cl.on && cl.k > 1.2 ? `<div class="banner info">🌡️ Marchés ${cl.reg[0]} (VIX ${num(cl.vix, 1)}) : si tu agis, étaler les achats ou ventes sur plusieurs semaines limite le risque de mauvais moment.</div>` : ''}
+    ${L.length ? `<div class="card"><div class="tbl-wrap"><table>
+      <thead><tr><th>Titre</th><th>Statut</th><th>Piste</th><th style="text-align:center">Score</th><th>Pourquoi</th><th></th></tr></thead>
+      <tbody>${L.map(x => `<tr id="piste-${x.a.id}"><td><b>${esc(nm(x.a))}</b><br><span class="small muted">${esc(TYPES[x.a.type] || '')}${x.held ? ' · ' + pctAbs(x.p.weight) : ''}</span></td>
+        <td>${x.held ? '<span class="tag">En portefeuille</span>' : '<span class="tag warn">🔎 À analyser</span>'}</td>
+        <td><span class="tag ${PISTE[x.k][1]}">${PISTE[x.k][0]}</span></td><td>${bar(x.score)}</td>
+        <td style="white-space:normal;min-width:340px"><ul class="small" style="margin:0;padding-left:0;list-style:none">${x.pts.map(t => `<li style="margin:2px 0"><span class="${t.s > 0 ? 'pos' : t.s < 0 ? 'neg' : 'muted'}">${t.s > 0 ? '▲' : t.s < 0 ? '▼' : '•'}</span> ${esc(t.t)}</li>`).join('')}</ul></td>
+        <td>${x.a.type === 'action' ? `<button class="btn sm" data-act="socproj" data-id="${x.a.id}">🔮</button> <button class="btn sm" data-act="socopen" data-id="${x.a.id}">🏢</button>` : `<button class="btn sm" data-act="asset" data-id="${x.a.id}">📈</button>`}</td></tr>`).join('')}</tbody></table></div></div>` : '<div class="card empty"><h2>Aucune ligne</h2><p>Les pistes portent sur tes actions et ETF détenus, et sur les sociétés marquées « 🔎 À analyser ».</p></div>'}
+    <div class="card"><h3>⚙️ Mes règles</h3><div class="form-grid">
+      ${inp('maxAction', 'Poids maximum d’une action (%)', 1)}${inp('maxEtf', 'Poids maximum d’un ETF ou fonds (%)', 1)}${inp('rendMin', 'Rendement annuel attendu minimum (%)', 1)}${inp('upMin', 'Écart minimum avec l’objectif des analystes (%)', 1)}${inp('gainLock', 'Plus-value latente à partir de laquelle sécuriser (%)', 1)}</div>
+      <details style="margin-top:8px"><summary class="small">Comment le score est calculé</summary><ul class="small">
+        <li>Actions : scénario central « bénéfices × PER » à 3 ans ≥ ton rendement minimum : +1 ; négatif : −1 ; même l’optimiste sous le cours : −1,5. Objectif des analystes ≥ ton écart minimum : +1 ; sous le cours : −1.</li>
+        <li>Tendance du cours : ±0,5. Actualité de la veille Tonio : ±0,5 (plutôt) ou ±1 (très).</li>
+        <li>Lignes détenues : au-dessus de ta limite de poids : −1 ; part du risque plus de 2× le poids : −1 ; grosse plus-value sur une ligne lourde : −0,5.</li>
+        <li>Score ≥ 1,5 : « renforcer » (ou « entrer ») à étudier ; ≤ −1,5 : « alléger » à étudier (≤ −1 : « pas maintenant » pour une société à analyser) ; sinon « conserver ». Avec moins de 2 éléments, pas de piste.</li>
+        <li>Avant de vendre : pense aux frais de courtage, à la taxe sur les opérations de bourse et à la taxe sur les plus-values (exonération annuelle de ${eur(CG_EXEMPTION)}).</li></ul></details></div>`;
+}
+(function installPistes() {
+  const tabs = document.getElementById('tabs'), ref = tabs && tabs.querySelector('[data-tab="projections"]');
+  if (ref && !tabs.querySelector('[data-tab="pistes"]')) {
+    ref.insertAdjacentHTML('afterend', '<button data-act="tab" data-tab="pistes">🧭 Pistes</button>');
+    document.getElementById('v-projections').insertAdjacentHTML('afterend', '<section id="v-pistes" class="view"></section>');
+  }
+})();
+document.addEventListener('change', e => {
+  const t = e.target; if (!t.dataset || !t.dataset.piste) return;
+  const v = socNum(t.value); if (v == null || Number.isNaN(v)) return toast('Nombre invalide.', 'err');
+  pisteSet()[t.dataset.piste] = v / 100; persist(); renderPistes();
+}, true);
+
 /* ---------------------------- Démarrage ---------------------------- */
 (async function init() {
   const t = (location.hash || '').slice(1);
-  if (['overview', 'positions', 'repartition', 'graphiques', 'transactions', 'analyse', 'alertes', 'parametres', 'bases'].includes(t)) currentTab = t;
+  if (['overview', 'positions', 'repartition', 'graphiques', 'transactions', 'analyse', 'societes', 'projections', 'pistes', 'alertes', 'parametres', 'bases'].includes(t)) currentTab = t;
   showTab(currentTab);
   try { tonioDir = (await IDB.get('tonioDir')) || null; coffreDir = (await IDB.get('coffreDir')) || null; } catch { tonioDir = null; coffreDir = null; }
   if (S.settings.autoTonio && (tonioDir || coffreDir)) saveAll(false);
@@ -2087,6 +3084,7 @@ TonioLien.init({
     let m;
     if ((m = /^(?:pos|watch)-(.+)$/.exec(id))) { if (!assetById(m[1])) return false; if (vue) showTab(vue); openAsset(m[1]); return true; }
     if ((m = /^move-(.+)-(\d{4}-\d{2}-\d{2})$/.exec(id))) { if (!assetById(m[1])) return false; openAsset(m[1]); return true; }
+    if ((m = /^piste-(.+)$/.exec(id))) { showTab('pistes'); const el = await L.attendre(() => document.getElementById('piste-' + m[1])); return el ? L.surligner(el) : true; }
     if ((m = /^alert-(.+)$/.exec(id))) {
       showTab('alertes');
       const el = await L.attendre(() => { const b = document.querySelector(`#v-alertes [data-id="${CSS.escape(m[1])}"]`); return b && b.closest('tr'); });
